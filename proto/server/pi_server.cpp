@@ -184,6 +184,25 @@ class DeviceState {
     response.set_allocated_packet(packet);
     stream->Write(response);
     response.release_packet();
+   
+    // Print master election id for debug 
+    Uint128 master_id = master->election_id();
+    std::cout << "connections.begin() election_id: " << master_id.low() << "\n";
+
+    auto slave_last = get_slave_last();
+    if (slave_last == nullptr) return;
+    // Print last slave of connections election id for debug 
+    Uint128 slave_last_id = slave_last->election_id();
+    std::cout << "connections.end()   election_id: " << slave_last_id.low() << "\n";
+    if (slave_last_id.low() == 1) {
+	 std::cout << "Send to NCS i.e. election_id == 1\n";  
+         auto stream_2 = slave_last->stream();
+         p4v1::StreamMessageResponse response_2;
+         response_2.set_allocated_packet(packet);
+         stream_2->Write(response_2);
+         response_2.release_packet();
+    }
+    
     pkt_in_count++;
   }
 
@@ -270,6 +289,10 @@ class DeviceState {
   }
 
  private:
+  Connection *get_slave_last() const {
+    return connections.empty() ? nullptr : *connections.rbegin() ;
+  }
+
   Connection *get_master() const {
     return connections.empty() ? nullptr : *connections.begin();
   }
