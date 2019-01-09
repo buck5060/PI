@@ -185,15 +185,9 @@ class DeviceState {
     stream->Write(response);
     response.release_packet();
    
-    // Print master election id for debug 
-    Uint128 master_id = master->election_id();
-    std::cout << "connections.begin() election_id: " << master_id.low() << "\n";
-
     auto slave_last = get_slave_last();
     if (slave_last == nullptr) return;
-    // Print last slave of connections election id for debug 
     Uint128 slave_last_id = slave_last->election_id();
-    std::cout << "connections.end()   election_id: " << slave_last_id.low() << "\n";
     if (slave_last_id.low() == 1) {
 	 std::cout << "Send to NCS i.e. election_id == 1\n";  
          auto stream_2 = slave_last->stream();
@@ -387,7 +381,7 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
     if (num_connections == 0 && request->has_election_id())
       return not_master_status();
     auto election_id = convert_u128(request->election_id());
-    if (num_connections > 0 && !device->is_master(election_id))
+    if (num_connections > 0 && !(device->is_master(election_id) || election_id.low() == 1))
       return not_master_status();
     auto device_mgr = device->get_p4_mgr();
     if (device_mgr == nullptr) return no_pipeline_config_status();

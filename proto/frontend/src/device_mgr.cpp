@@ -333,7 +333,8 @@ class DeviceMgrImp {
       // yet.
       table_info_store.add_entry(
           t_id, match_key,
-          TableInfoStore::Data(0  /* handle */, 0  /* controller_metadata */));
+          TableInfoStore::Data(0  /* handle */, 0  /* controller_metadata */, 0 /* role_id */)
+          );
     }
 
     action_profs.clear();
@@ -561,6 +562,7 @@ class DeviceMgrImp {
 
   Status table_write(p4v1::Update::Type update,
                      const p4v1::TableEntry &table_entry,
+                     const uint64_t role_id,
                      SessionTemp *session) {
     if (!check_p4_id(table_entry.table_id(), P4Ids::TABLE))
       return make_invalid_p4_id_status();
@@ -571,11 +573,11 @@ class DeviceMgrImp {
         status.set_code(Code::INVALID_ARGUMENT);
         break;
       case p4v1::Update::INSERT:
-        return table_insert(table_entry, session);
+        return table_insert(table_entry, role_id, session);
       case p4v1::Update::MODIFY:
-        return table_modify(table_entry, session);
+        return table_modify(table_entry, role_id, session);
       case p4v1::Update::DELETE:
-        return table_delete(table_entry, session);
+        return table_delete(table_entry, role_id, session);
       default:
         status.set_code(Code::INVALID_ARGUMENT);
         break;
@@ -1783,7 +1785,7 @@ class DeviceMgrImp {
           status.set_code(Code::UNIMPLEMENTED);
           break;
         case p4v1::Entity::kTableEntry:
-          status = table_write(update.type(), entity.table_entry(), &session);
+          status = table_write(update.type(), entity.table_entry(), request.role_id(), &session);
           break;
         case p4v1::Entity::kActionProfileMember:
           status = action_profile_member_write(
@@ -2249,6 +2251,7 @@ class DeviceMgrImp {
   }
 
   Status table_insert(const p4v1::TableEntry &table_entry,
+                      const uint64_t role_id,
                       SessionTemp *session) {
     const auto table_id = table_entry.table_id();
     if (table_entry.is_default_action()) {
@@ -2302,18 +2305,19 @@ class DeviceMgrImp {
       table_info_store.add_entry(
           table_id, match_key,
           TableInfoStore::Data(handle, table_entry.controller_metadata(),
-                               action_entry.indirect_handle()));
+                               action_entry.indirect_handle(), role_id));
       session->cleanup_scope_pop();
     } else {
       table_info_store.add_entry(
           table_id, match_key,
-          TableInfoStore::Data(handle, table_entry.controller_metadata()));
+          TableInfoStore::Data(handle, table_entry.controller_metadata(), role_id));
     }
 
     RETURN_OK_STATUS();
   }
 
   Status table_modify(const p4v1::TableEntry &table_entry,
+                      const uint64_t role_id,
                       SessionTemp *session) {
     const auto table_id = table_entry.table_id();
     pi::MatchKey match_key(p4info.get(), table_id);
@@ -2354,6 +2358,13 @@ class DeviceMgrImp {
     if (entry_data == nullptr)
       RETURN_ERROR_STATUS(Code::NOT_FOUND, "Cannot find match entry");
 
+    if (entry_data->role_id != role_id){
+      RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
+                          "Table entry's role id {} didn't match request's role id {}", 
+                          entry_data->role_id,
+                          role_id);
+    }
+    
     pi::MatchTable mt(session->get(), device_tgt, p4info.get(), table_id);
     pi_status_t pi_status;
     if (table_entry.is_default_action()) {
@@ -2391,6 +2402,7 @@ class DeviceMgrImp {
   }
 
   Status table_delete(const p4v1::TableEntry &table_entry,
+                      const uint64_t role_id,
                       SessionTemp *session) {
     const auto table_id = table_entry.table_id();
     if (table_entry.is_default_action()) {
@@ -2410,6 +2422,13 @@ class DeviceMgrImp {
     auto entry_data = table_info_store.get_entry(table_id, match_key);
     if (entry_data == nullptr)
       RETURN_ERROR_STATUS(Code::NOT_FOUND, "Cannot find match entry");
+
+    if (entry_data->role_id != role_id) {
+      RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
+                          "Table entry's role id {} didn't match request's role id {}", 
+                          entry_data->role_id,
+                          role_id);
+    }
 
     pi::MatchTable mt(session->get(), device_tgt, p4info.get(), table_id);
     auto pi_status = mt.entry_delete_wkey(match_key);
