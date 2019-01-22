@@ -28,6 +28,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <iostream>
+#include <bitset>
 
 #include "gnmi.h"
 #include "gnmi/gnmi.grpc.pb.h"
@@ -124,29 +126,36 @@ class ConnectionId {
 class Connection {
  public:
   static std::unique_ptr<Connection> make(const Uint128 &election_id,
+                                          const uint64_t role_id,
                                           StreamChannelReaderWriter *stream,
                                           ServerContext *context) {
     (void) context;
     return std::unique_ptr<Connection>(
-        new Connection(ConnectionId::get(), election_id, stream));
+        new Connection(ConnectionId::get(), election_id, role_id, stream));
   }
 
   const ConnectionId::Id &connection_id() const { return connection_id_; }
   const Uint128 &election_id() const { return election_id_; }
+  const uint64_t role_id() const { return role_id_; }
   StreamChannelReaderWriter *stream() const { return stream_; }
 
   void set_election_id(const Uint128 &election_id) {
     election_id_ = election_id;
   }
 
+  void set_role_id(const uint64_t role_id) {
+    role_id_ = role_id;
+  }
+
  private:
-  Connection(ConnectionId::Id connection_id, const Uint128 &election_id,
+  Connection(ConnectionId::Id connection_id, const Uint128 &election_id, const uint64_t role_id,
              StreamChannelReaderWriter *stream)
-      : connection_id_(connection_id), election_id_(election_id),
+      : connection_id_(connection_id), election_id_(election_id), role_id_(role_id),
         stream_(stream) { }
 
   ConnectionId::Id connection_id_{0};
   Uint128 election_id_{0};
+  uint64_t role_id_{0};
   StreamChannelReaderWriter *stream_{nullptr};
 };
 
@@ -177,26 +186,29 @@ class DeviceState {
 
   void send_packet_in(p4v1::PacketIn *packet) {
     std::lock_guard<std::mutex> lock(m);
-    auto master = get_master();
-    if (master == nullptr) return;
-    auto stream = master->stream();
-    p4v1::StreamMessageResponse response;
-    response.set_allocated_packet(packet);
-    stream->Write(response);
-    response.release_packet();
-   
-    auto slave_last = get_slave_last();
-    if (slave_last == nullptr) return;
-    Uint128 slave_last_id = slave_last->election_id();
-    if (slave_last_id.low() == 1) {
-	 std::cout << "Send to NCS i.e. election_id == 1\n";  
-         auto stream_2 = slave_last->stream();
-         p4v1::StreamMessageResponse response_2;
-         response_2.set_allocated_packet(packet);
-         stream_2->Write(response_2);
-         response_2.release_packet();
+    //Get role_id from packet
+    p4v1::PacketMetadata metadata = packet->metadata(1);
+    uint64_t role_id = 0;
+    for (char c : metadata.value())
+      role_id = (role_id << 1) | c;
+
+    auto connection_role_id = get_role_id(role_id);
+    if (connection_role_id != nullptr){
+      auto stream = connection_role_id->stream();
+      p4v1::StreamMessageResponse response;
+      response.set_allocated_packet(packet);
+      stream->Write(response);
+      response.release_packet();
+    } else {
+      auto master = get_master();
+      if (master == nullptr) return;
+      auto stream = master->stream();
+      p4v1::StreamMessageResponse response;
+      response.set_allocated_packet(packet);
+      stream->Write(response);
+      response.release_packet();
     }
-    
+
     pkt_in_count++;
   }
 
@@ -224,14 +236,16 @@ class DeviceState {
   }
 
   Status update_connection(Connection *connection,
-                           const Uint128 &new_election_id) {
+                           const Uint128 &new_election_id,
+                           uint64_t new_role_id) {
     std::lock_guard<std::mutex> lock(m);
-    if (connection->election_id() == new_election_id) return Status::OK;
+    if (connection->election_id() == new_election_id && connection->role_id() == new_role_id) return Status::OK;
     auto connection_it = connections.find(connection);
     assert(connection_it != connections.end());
     auto was_master = (connection_it == connections.begin());
     connections.erase(connection_it);
     connection->set_election_id(new_election_id);
+    connection->set_role_id(new_role_id);
     auto p = connections.insert(connection);
     if (!p.second) {
       return Status(StatusCode::INVALID_ARGUMENT,
@@ -293,6 +307,17 @@ class DeviceState {
 
   bool is_master(const Connection *connection) const {
     return connection == get_master();
+  }
+
+  Connection *get_role_id(const uint64_t role_id) const {
+    for (auto connection : connections) {
+      if (connection->role_id() == role_id) {
+        SIMPLELOG << "Found Connection role_id == " << role_id << "\n";
+        return connection;
+      }
+    }
+
+    return nullptr;
   }
 
   void notify_one(const Connection *connection) const {
@@ -462,6 +487,7 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
             auto device_id = request.arbitration().device_id();
             auto election_id = convert_u128(
                 request.arbitration().election_id());
+            auto role_id = request.arbitration().role().id();
             // TODO(antonin): a lot of existing code will break if 0 is not
             // valid anymore
             // if (election_id == 0) {
@@ -476,7 +502,7 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
             }
             if (connection == nullptr) {
               connection_status.connection = Connection::make(
-                  election_id, stream, context);
+                  election_id, role_id, stream, context);
               auto status = Devices::get(device_id)->add_connection(
                   connection_status.connection.get());
               if (!status.ok()) {
@@ -486,7 +512,7 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
               connection_status.device_id = device_id;
             } else {
               auto status = Devices::get(device_id)->update_connection(
-                  connection_status.connection.get(), election_id);
+                  connection_status.connection.get(), election_id, role_id);
               if (!status.ok()) return status;
             }
           }
