@@ -192,7 +192,7 @@ class DeviceState {
     for (char c : metadata.value())
       role_id = (role_id << 1) | c;
 
-    auto connection_role_id = get_role_id(role_id);
+    auto connection_role_id = get_by_role_id(role_id);
     if (connection_role_id != nullptr){
       auto stream = connection_role_id->stream();
       p4v1::StreamMessageResponse response;
@@ -217,7 +217,7 @@ class DeviceState {
     return pkt_in_count;
   }
 
-  Status add_connection(Connection *connection) {
+  Status add_connection(Connection *connection, p4v1::RoleConfig &role_config) {
     std::lock_guard<std::mutex> lock(m);
     if (connections.size() >= max_connections)
       return Status(StatusCode::RESOURCE_EXHAUSTED, "Too many connections");
@@ -228,18 +228,25 @@ class DeviceState {
     }
     SIMPLELOG << "New connection\n";
     auto is_master = (p.first == connections.begin());
-    if (is_master)
+    if (is_master) {
       notify_all();
-    else
+    } else
       notify_one(connection);
     return Status::OK;
   }
 
   Status update_connection(Connection *connection,
                            const Uint128 &new_election_id,
-                           uint64_t new_role_id) {
+                           uint64_t new_role_id, 
+                           p4v1::RoleConfig &role_config) {
     std::lock_guard<std::mutex> lock(m);
-    if (connection->election_id() == new_election_id && connection->role_id() == new_role_id) return Status::OK;
+    if (connection->election_id() == new_election_id && connection->role_id() == new_role_id){
+      if(is_master(connection) && connection->role_id() == 0) {
+        update_role_config(role_config);
+        notify_one(connection);
+      }
+      return Status::OK;
+    }
     auto connection_it = connections.find(connection);
     assert(connection_it != connections.end());
     auto was_master = (connection_it == connections.begin());
@@ -253,9 +260,10 @@ class DeviceState {
     }
     auto is_master = (p.first == connections.begin());
     auto master_changed = (is_master != was_master);
-    if (master_changed)
+    if (master_changed) {
       notify_all();
-    else
+      update_role_config(role_config);
+    } else
       notify_one(connection);
     return Status::OK;
   }
@@ -309,7 +317,7 @@ class DeviceState {
     return connection == get_master();
   }
 
-  Connection *get_role_id(const uint64_t role_id) const {
+  Connection *get_by_role_id(const uint64_t role_id) const {
     for (auto connection : connections) {
       if (connection->role_id() == role_id) {
         SIMPLELOG << "Found Connection role_id == " << role_id << "\n";
@@ -318,6 +326,11 @@ class DeviceState {
     }
 
     return nullptr;
+  }
+
+  void update_role_config(p4v1::RoleConfig &role_config) {
+    SIMPLELOG << "Try to set Role Config\n";
+    device_mgr->update_role_config(role_config);
   }
 
   void notify_one(const Connection *connection) const {
@@ -406,11 +419,12 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
     if (num_connections == 0 && request->has_election_id())
       return not_master_status();
     auto election_id = convert_u128(request->election_id());
-    if (num_connections > 0 && !(device->is_master(election_id) || election_id.low() == 1))
-      return not_master_status();
+    auto role_id = request->role_id();
+    // if (num_connections > 0 && !(device->is_master(election_id) || election_id.low() == 1))
+    //   return not_master_status();
     auto device_mgr = device->get_p4_mgr();
     if (device_mgr == nullptr) return no_pipeline_config_status();
-    auto status = device_mgr->write(*request);
+    auto status = device_mgr->write(*request, (device->is_master(election_id) && role_id == 0) );
     return to_grpc_status(status);
   }
 
@@ -488,6 +502,9 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
             auto election_id = convert_u128(
                 request.arbitration().election_id());
             auto role_id = request.arbitration().role().id();
+            auto role_config_any = request.arbitration().role().config();
+            p4v1::RoleConfig role_config;
+            role_config_any.UnpackTo(&role_config);
             // TODO(antonin): a lot of existing code will break if 0 is not
             // valid anymore
             // if (election_id == 0) {
@@ -504,7 +521,7 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
               connection_status.connection = Connection::make(
                   election_id, role_id, stream, context);
               auto status = Devices::get(device_id)->add_connection(
-                  connection_status.connection.get());
+                  connection_status.connection.get(), role_config);
               if (!status.ok()) {
                 connection_status.connection.release();
                 return status;
@@ -512,7 +529,7 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
               connection_status.device_id = device_id;
             } else {
               auto status = Devices::get(device_id)->update_connection(
-                  connection_status.connection.get(), election_id, role_id);
+                  connection_status.connection.get(), election_id, role_id, role_config);
               if (!status.ok()) return status;
             }
           }

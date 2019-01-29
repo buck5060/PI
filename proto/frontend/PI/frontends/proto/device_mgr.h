@@ -63,8 +63,10 @@ class DeviceMgr {
       p4::v1::GetForwardingPipelineConfigRequest::ResponseType response_type,
       p4::v1::ForwardingPipelineConfig *config);
 
+  Status update_role_config(const p4::v1::RoleConfig &role_config);
+  
   // New write and read methods, meant to replace all the methods below
-  Status write(const p4::v1::WriteRequest &request);
+  Status write(const p4::v1::WriteRequest &request, bool is_master);
 
   Status read(const p4::v1::ReadRequest &request,
               p4::v1::ReadResponse *response) const;

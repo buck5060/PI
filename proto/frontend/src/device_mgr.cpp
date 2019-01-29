@@ -493,7 +493,7 @@ class DeviceMgrImp {
         update->set_type(p4v1::Update::INSERT);
         update->set_allocated_entity(&entity);
       }
-      auto status = write_(write_request);
+      auto status = write_(write_request, 1);
       for (auto &update : *write_request.mutable_updates())
         update.release_entity();
       if (IS_ERROR(status))
@@ -543,9 +543,14 @@ class DeviceMgrImp {
     RETURN_OK_STATUS();
   }
 
-  Status write(const p4v1::WriteRequest &request) {
+  Status update_role_config(const p4::v1::RoleConfig &role_config) {
     auto lock = shared_lock();
-    return write_(request);
+    return update_role_config_(role_config);
+  }
+
+  Status write(const p4v1::WriteRequest &request, bool is_master) {
+    auto lock = shared_lock();
+    return write_(request, is_master);
   }
 
   Status read(const p4v1::ReadRequest &request,
@@ -563,6 +568,7 @@ class DeviceMgrImp {
   Status table_write(p4v1::Update::Type update,
                      const p4v1::TableEntry &table_entry,
                      const uint64_t role_id,
+                     bool is_master,
                      SessionTemp *session) {
     if (!check_p4_id(table_entry.table_id(), P4Ids::TABLE))
       return make_invalid_p4_id_status();
@@ -573,11 +579,11 @@ class DeviceMgrImp {
         status.set_code(Code::INVALID_ARGUMENT);
         break;
       case p4v1::Update::INSERT:
-        return table_insert(table_entry, role_id, session);
+        return table_insert(table_entry, role_id, is_master, session);
       case p4v1::Update::MODIFY:
-        return table_modify(table_entry, role_id, session);
+        return table_modify(table_entry, role_id, is_master, session);
       case p4v1::Update::DELETE:
-        return table_delete(table_entry, role_id, session);
+        return table_delete(table_entry, role_id, is_master, session);
       default:
         status.set_code(Code::INVALID_ARGUMENT);
         break;
@@ -1766,8 +1772,27 @@ class DeviceMgrImp {
     return status;
   }
 
+  Status update_role_config_(const p4v1::RoleConfig &role_config) {
+    Status status;
+    status.set_code(Code::OK);
+    for (const auto entry : role_config.entries()) {
+      const auto &entity = entry.entity();
+      switch (entity.entity_case()) {
+        case p4v1::Entity::kTableEntry:
+          status = table_set_role(entity.table_entry(), entry.shared());
+          break;
+        default:
+          status = ERROR_STATUS(Code::UNIMPLEMENTED, "Role Config only supports TableEntry Now");
+          break;
+      }
+    }
+    return status;
+  }
+
+
+
   // internal version of write, which does not acquire a shared lock
-  Status write_(const p4v1::WriteRequest &request) {
+  Status write_(const p4v1::WriteRequest &request, bool is_master) {
     if (request.atomicity() != p4v1::WriteRequest::CONTINUE_ON_ERROR) {
       RETURN_ERROR_STATUS(
           Code::UNIMPLEMENTED,
@@ -1785,7 +1810,7 @@ class DeviceMgrImp {
           status.set_code(Code::UNIMPLEMENTED);
           break;
         case p4v1::Entity::kTableEntry:
-          status = table_write(update.type(), entity.table_entry(), request.role_id(), &session);
+          status = table_write(update.type(), entity.table_entry(), request.role_id(), is_master, &session);
           break;
         case p4v1::Entity::kActionProfileMember:
           status = action_profile_member_write(
@@ -2250,13 +2275,28 @@ class DeviceMgrImp {
     RETURN_OK_STATUS();
   }
 
+  Status table_set_role(const p4v1::TableEntry &table_entry,
+                        const bool shared) {
+    const auto table_id = table_entry.table_id();
+    auto table_lock = table_info_store.lock_table(table_id);
+    table_info_store.set_table_role(table_id, shared);
+    
+    RETURN_OK_STATUS();
+  }
+
   Status table_insert(const p4v1::TableEntry &table_entry,
                       const uint64_t role_id,
+                      bool is_master,
                       SessionTemp *session) {
     const auto table_id = table_entry.table_id();
     if (table_entry.is_default_action()) {
       RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
                           "Cannot use INSERT for default entry");
+    }
+
+    if (!table_info_store.get_table_role(table_id) && !is_master){
+      RETURN_ERROR_STATUS(Code::PERMISSION_DENIED,
+                          "Not Shared Table or Not Master");
     }
 
     pi::MatchKey match_key(p4info.get(), table_id);
@@ -2318,12 +2358,18 @@ class DeviceMgrImp {
 
   Status table_modify(const p4v1::TableEntry &table_entry,
                       const uint64_t role_id,
+                      bool is_master,
                       SessionTemp *session) {
     const auto table_id = table_entry.table_id();
     pi::MatchKey match_key(p4info.get(), table_id);
     {
       auto status = construct_match_key(table_entry, &match_key);
       if (IS_ERROR(status)) return status;
+    }
+
+    if (!table_info_store.get_table_role(table_id) && !is_master){
+      RETURN_ERROR_STATUS(Code::PERMISSION_DENIED,
+                          "Not Shared Table or Not Master");
     }
 
     pi::ActionEntry action_entry;
@@ -2403,11 +2449,17 @@ class DeviceMgrImp {
 
   Status table_delete(const p4v1::TableEntry &table_entry,
                       const uint64_t role_id,
+                      bool is_master,
                       SessionTemp *session) {
     const auto table_id = table_entry.table_id();
     if (table_entry.is_default_action()) {
       RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
                           "Cannot use DELETE for default entry");
+    }
+
+    if (!table_info_store.get_table_role(table_id) && !is_master){
+      RETURN_ERROR_STATUS(Code::PERMISSION_DENIED,
+                          "Not Shared Table or Not Master");
     }
 
     pi::MatchKey match_key(p4info.get(), table_id);
@@ -2676,8 +2728,13 @@ DeviceMgr::pipeline_config_get(
 }
 
 Status
-DeviceMgr::write(const p4v1::WriteRequest &request) {
-  return pimp->write(request);
+DeviceMgr::update_role_config(const p4::v1::RoleConfig &role_config) {
+  return pimp->update_role_config(role_config);
+}
+
+Status
+DeviceMgr::write(const p4v1::WriteRequest &request, bool is_master) {
+  return pimp->write(request, is_master);
 }
 
 Status

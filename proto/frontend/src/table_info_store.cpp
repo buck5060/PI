@@ -55,10 +55,19 @@ class TableInfoStoreOne {
 
   Lock lock() const { return Lock(mutex); }
 
+  bool is_shared() {
+     return shared; 
+  }
+
+  void set_shared(bool share) {
+    shared = share;
+  }
+    
  private:
   mutable Mutex mutex{};
   std::unordered_map<MatchKey, Data, pi::MatchKeyHash, pi::MatchKeyEq>
   data_map{};
+  bool shared;
 };
 
 TableInfoStore::TableInfoStore() = default;
@@ -87,6 +96,18 @@ void
 TableInfoStore::remove_entry(pi_p4_id_t t_id, const MatchKey &mk) {
   auto &table = tables.at(t_id);
   table->remove_entry(mk);
+}
+
+void
+TableInfoStore::set_table_role(pi_p4_id_t t_id, bool shared) {
+  auto &table = tables.at(t_id);
+  table->set_shared(shared);
+}
+
+bool
+TableInfoStore::get_table_role(pi_p4_id_t t_id) {
+  auto &table = tables.at(t_id);
+  return table->is_shared();
 }
 
 Data *
