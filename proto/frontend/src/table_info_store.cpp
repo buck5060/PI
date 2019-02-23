@@ -105,7 +105,7 @@ TableInfoStore::set_table_role(pi_p4_id_t t_id, bool shared) {
 }
 
 bool
-TableInfoStore::get_table_role(pi_p4_id_t t_id) {
+TableInfoStore::get_table_role(pi_p4_id_t t_id) const {
   auto &table = tables.at(t_id);
   return table->is_shared();
 }

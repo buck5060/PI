@@ -562,7 +562,7 @@ class DeviceMgrImp {
   Status read_one(const p4v1::Entity &entity,
                   p4v1::ReadResponse *response) const {
     auto lock = unique_lock();
-    return read_one_(entity, response);
+    return read_one_(entity, 0, response);
   }
 
   Status table_write(p4v1::Update::Type update,
@@ -1062,6 +1062,7 @@ class DeviceMgrImp {
   }
 
   Status table_read_one(p4_id_t table_id,
+                        uint64_t role_id,
                         const p4v1::TableEntry &requested_entry,
                         const SessionTemp &session,
                         p4v1::ReadResponse *response) const {
@@ -1114,6 +1115,14 @@ class DeviceMgrImp {
         continue;
       }
 
+      // Check if table entry is own by the role id (with table entry exist in tableinfostroe)
+      if (!pi_p4info_table_is_const(p4info.get(), table_id)) {
+        auto entry_data = table_info_store.get_entry(table_id, mk);
+        if (entry_data->role_id != role_id && role_id != 0){
+          continue;
+        }
+      }
+      
       auto *table_entry = response->add_entities()->mutable_table_entry();
       table_entry->set_table_id(table_id);
       code = parse_match_key(table_id, entry.match_key, table_entry);
@@ -1181,21 +1190,29 @@ class DeviceMgrImp {
 
   // TODO(antonin): full filtering on the match key, action, ... as per the spec
   Status table_read(const p4v1::TableEntry &table_entry,
+                    uint64_t role_id,
                     const SessionTemp &session,
                     p4v1::ReadResponse *response) const {
     if (table_entry.table_id() == 0) {  // read all entries for all tables
       for (auto t_id = pi_p4info_table_begin(p4info.get());
            t_id != pi_p4info_table_end(p4info.get());
            t_id = pi_p4info_table_next(p4info.get(), t_id)) {
-        auto status = table_read_one(t_id, table_entry, session, response);
-        if (IS_ERROR(status)) return status;
+            if (role_id == 0 || table_info_store.get_table_role(t_id)) {
+              auto status = table_read_one(t_id, role_id, table_entry, session, response);
+              if (IS_ERROR(status)) return status;
+            }
       }
     } else {  // read for a single table
       if (!check_p4_id(table_entry.table_id(), P4Ids::TABLE))
         return make_invalid_p4_id_status();
-      auto status = table_read_one(
-          table_entry.table_id(), table_entry, session, response);
-      if (IS_ERROR(status)) return status;
+      if (role_id == 0 || table_info_store.get_table_role(table_entry.table_id())) {
+        auto status = table_read_one(
+            table_entry.table_id(), role_id, table_entry, session, response);
+        if (IS_ERROR(status)) return status;
+      } else {
+        RETURN_ERROR_STATUS(Code::PERMISSION_DENIED,
+                        "Not Shared Table or Not Master");
+      }
     }
     RETURN_OK_STATUS();
   }
@@ -1712,7 +1729,8 @@ class DeviceMgrImp {
     Status status;
     status.set_code(Code::OK);
     for (const auto &entity : request.entities()) {
-      status = read_one_(entity, response);
+      uint64_t role_id = request.role_id();
+      status = read_one_(entity, role_id, response);
       if (status.code() != Code::OK) break;
     }
     return status;
@@ -1720,12 +1738,13 @@ class DeviceMgrImp {
 
   // internal version of read_one, which does not acquire an exclusive lock
   Status read_one_(const p4v1::Entity &entity,
+                   uint64_t role_id,
                    p4v1::ReadResponse *response) const {
     Status status;
     SessionTemp session(false  /* = batch */);
     switch (entity.entity_case()) {
       case p4v1::Entity::kTableEntry:
-        status = table_read(entity.table_entry(), session, response);
+        status = table_read(entity.table_entry(), role_id, session, response);
         break;
       case p4v1::Entity::kActionProfileMember:
         status = action_profile_member_read(

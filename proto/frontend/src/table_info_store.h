@@ -82,7 +82,7 @@ class TableInfoStore {
 
   void set_table_role(pi_p4_id_t t_id, bool shared);
 
-  bool get_table_role(pi_p4_id_t t_id);
+  bool get_table_role(pi_p4_id_t t_id) const ;
 
   Data *get_entry(pi_p4_id_t t_id, const MatchKey &mk) const;
 
