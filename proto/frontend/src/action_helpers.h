@@ -34,7 +34,8 @@ namespace proto {
 
 using Status = ::google::rpc::Status;
 
-Status validate_action_data(pi_p4info_t *p4info, const p4::v1::Action &action);
+Status validate_action_data(const pi_p4info_t *p4info,
+                            const p4::v1::Action &action);
 
 }  // namespace proto
 

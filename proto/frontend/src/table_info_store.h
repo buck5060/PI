@@ -46,16 +46,23 @@ class TableInfoStore {
   using MatchKey = pi::MatchKey;
 
   struct Data {
-    Data(pi_entry_handle_t handle, uint64_t controller_metadata, uint64_t role_id)
-        : handle(handle), controller_metadata(controller_metadata), role_id(role_id) { }
 
     Data(pi_entry_handle_t handle, uint64_t controller_metadata,
-         pi_indirect_handle_t oneshot_group_handle, uint64_t role_id)
+         uint64_t idle_timeout_ns, uint64_t role_id)
         : handle(handle), controller_metadata(controller_metadata),
-          is_oneshot(true), oneshot_group_handle(oneshot_group_handle), role_id(role_id) { }
+          idle_timeout_ns(idle_timeout_ns),
+          role_id(role_id) { }
+
+    Data(pi_entry_handle_t handle, uint64_t controller_metadata,
+         uint64_t idle_timeout_ns, pi_indirect_handle_t oneshot_group_handle, uint64_t role_id)
+        : handle(handle), controller_metadata(controller_metadata),
+          idle_timeout_ns(idle_timeout_ns),
+          is_oneshot(true), oneshot_group_handle(oneshot_group_handle),
+          role_id(role_id) { }
 
     const pi_entry_handle_t handle{0};
     uint64_t controller_metadata{0};
+    int64_t idle_timeout_ns{0};
     // wish I could use boost::optional here
     bool is_oneshot{false};
     pi_indirect_handle_t oneshot_group_handle{0};

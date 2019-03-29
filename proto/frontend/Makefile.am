@@ -10,8 +10,6 @@ AM_CPPFLAGS = \
 -I$(top_srcdir)/p4info \
 -I$(top_srcdir)/third_party
 
-AM_CXXFLAGS = -Wall -Werror
-
 libpifeproto_la_SOURCES = \
 src/device_mgr.cpp \
 src/action_prof_mgr.h \
@@ -20,6 +18,8 @@ src/table_info_store.h \
 src/table_info_store.cpp \
 src/action_helpers.h \
 src/action_helpers.cpp \
+src/match_key_helpers.h \
+src/match_key_helpers.cpp \
 src/packet_io_mgr.h \
 src/packet_io_mgr.cpp \
 src/common.h \
@@ -30,7 +30,13 @@ src/report_error.h \
 src/pre_mc_mgr.h \
 src/pre_mc_mgr.cpp \
 src/pre_clone_mgr.h \
-src/pre_clone_mgr.cpp
+src/pre_clone_mgr.cpp \
+src/task_queue.h \
+src/digest_mgr.h \
+src/digest_mgr.cpp \
+src/statusor.h \
+src/idle_timeout_buffer.h \
+src/idle_timeout_buffer.cpp
 
 libpifeproto_la_LIBADD = \
 $(top_builddir)/../frontends_extra/cpp/libpifecpp.la \

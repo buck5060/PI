@@ -125,9 +125,16 @@ static pi_status_t read_tables(cJSON *root, pi_p4info_t *p4info) {
     if (item->type != cJSON_True && item->type != cJSON_False)
       return PI_STATUS_CONFIG_READER_ERROR;
     bool is_const = (item->type == cJSON_True);
+    item = cJSON_GetObjectItem(table, "supports_idle_timeout");
+    bool supports_idle_timeout = false;
+    if (item) {
+      if (item->type != cJSON_True && item->type != cJSON_False)
+        return PI_STATUS_CONFIG_READER_ERROR;
+      supports_idle_timeout = (item->type == cJSON_True);
+    }
 
     pi_p4info_table_add(p4info, pi_id, name, num_match_fields, num_actions,
-                        max_size, is_const);
+                        max_size, is_const, supports_idle_timeout);
 
     import_common(table, p4info, pi_id);
 
@@ -155,17 +162,20 @@ static pi_status_t read_tables(cJSON *root, pi_p4info_t *p4info) {
 
     cJSON *action;
     cJSON_ArrayForEach(action, actions) {
-      pi_p4_id_t id = action->valueint;
-      pi_p4info_table_add_action(p4info, pi_id, id);
+      item = cJSON_GetObjectItem(action, "id");
+      if (!item) return PI_STATUS_CONFIG_READER_ERROR;
+      pi_p4_id_t id = item->valueint;
+      item = cJSON_GetObjectItem(action, "scope");
+      if (!item) return PI_STATUS_CONFIG_READER_ERROR;
+      pi_p4info_action_scope_t scope = (pi_p4info_action_scope_t)item->valueint;
+      pi_p4info_table_add_action(p4info, pi_id, id, scope);
     }
 
     item = cJSON_GetObjectItem(table, "const_default_action_id");
     if (item && item->valueint != PI_INVALID_ID) {
       pi_p4_id_t const_default_action_id = item->valueint;
-      item = cJSON_GetObjectItem(table, "has_mutable_action_params");
-      bool has_mutable_action_params = item && (item->valueint != 0);
-      pi_p4info_table_set_const_default_action(
-          p4info, pi_id, const_default_action_id, has_mutable_action_params);
+      pi_p4info_table_set_const_default_action(p4info, pi_id,
+                                               const_default_action_id);
     }
 
     item = cJSON_GetObjectItem(table, "implementation");
@@ -330,6 +340,43 @@ static pi_status_t read_direct_meters(cJSON *root, pi_p4info_t *p4info) {
   return read_meters_generic(meters, p4info);
 }
 
+static pi_status_t read_digests(cJSON *root, pi_p4info_t *p4info) {
+  assert(root);
+  cJSON *digests = cJSON_GetObjectItem(root, "digests");
+  if (!digests) return PI_STATUS_CONFIG_READER_ERROR;
+  size_t num_digests = cJSON_GetArraySize(digests);
+  pi_p4info_digest_init(p4info, num_digests);
+
+  cJSON *digest;
+  cJSON_ArrayForEach(digest, digests) {
+    const cJSON *item;
+    item = cJSON_GetObjectItem(digest, "name");
+    if (!item) return PI_STATUS_CONFIG_READER_ERROR;
+    const char *name = item->valuestring;
+    item = cJSON_GetObjectItem(digest, "id");
+    if (!item) return PI_STATUS_CONFIG_READER_ERROR;
+    pi_p4_id_t pi_id = item->valueint;
+
+    cJSON *fields = cJSON_GetObjectItem(digest, "fields");
+    if (!fields) return PI_STATUS_CONFIG_READER_ERROR;
+    pi_p4info_digest_add(p4info, pi_id, name, cJSON_GetArraySize(fields));
+    import_common(digest, p4info, pi_id);
+
+    cJSON *field;
+    cJSON_ArrayForEach(field, fields) {
+      item = cJSON_GetObjectItem(field, "name");
+      if (!item) return PI_STATUS_CONFIG_READER_ERROR;
+      const char *f_name = item->valuestring;
+      item = cJSON_GetObjectItem(field, "bitwidth");
+      if (!item) return PI_STATUS_CONFIG_READER_ERROR;
+      pi_p4_id_t f_bitwidth = item->valueint;
+      pi_p4info_digest_add_field(p4info, pi_id, f_name, f_bitwidth);
+    }
+  }
+
+  return PI_STATUS_SUCCESS;
+}
+
 pi_status_t pi_native_json_reader(const char *config, pi_p4info_t *p4info) {
   cJSON *root = cJSON_Parse(config);
   if (!root) return PI_STATUS_CONFIG_READER_ERROR;
@@ -361,6 +408,10 @@ pi_status_t pi_native_json_reader(const char *config, pi_p4info_t *p4info) {
   }
 
   if ((status = read_direct_meters(root, p4info)) != PI_STATUS_SUCCESS) {
+    return status;
+  }
+
+  if ((status = read_digests(root, p4info)) != PI_STATUS_SUCCESS) {
     return status;
   }
 

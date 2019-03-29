@@ -27,11 +27,13 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <cstdint>
 
 #include "PI/pi.h"
 #include "PI/pi_clone.h"
+#include "PI/pi_learn.h"
 #include "PI/pi_mc.h"
 
 namespace pi {
@@ -39,6 +41,14 @@ namespace proto {
 namespace testing {
 
 using device_id_t = uint64_t;
+
+enum PiActProfApiSupport {
+  PiActProfApiSupport_SET_MBRS = PI_ACT_PROF_API_SUPPORT_GRP_SET_MBRS,
+  PiActProfApiSupport_ADD_AND_REMOVE_MBR =
+    PI_ACT_PROF_API_SUPPORT_GRP_ADD_AND_REMOVE_MBR,
+  PiActProfApiSupport_BOTH = PI_ACT_PROF_API_SUPPORT_GRP_SET_MBRS |
+    PI_ACT_PROF_API_SUPPORT_GRP_ADD_AND_REMOVE_MBR,
+};
 
 class DummySwitch;
 
@@ -83,6 +93,13 @@ class DummySwitchMock {
 
   pi_status_t packetin_inject(const std::string &packet) const;
 
+  pi_status_t digest_inject(pi_p4_id_t learn_id,
+                            pi_learn_msg_id_t msg_id,
+                            const std::vector<std::string> &samples) const;
+
+  pi_status_t age_entry(pi_p4_id_t table_id,
+                        pi_entry_handle_t entry_handle) const;
+
   void set_p4info(const pi_p4info_t *p4info);
 
   void reset();
@@ -102,6 +119,10 @@ class DummySwitchMock {
                            const pi_table_entry_t *));
   MOCK_METHOD2(table_entries_fetch,
                pi_status_t(pi_p4_id_t, pi_table_fetch_res_t *));
+  MOCK_METHOD2(table_idle_timeout_config_set,
+               pi_status_t(pi_p4_id_t, const pi_idle_timeout_config_t *));
+  MOCK_METHOD3(table_entry_get_remaining_ttl,
+               pi_status_t(pi_p4_id_t, pi_entry_handle_t, uint64_t *));
 
   MOCK_METHOD3(action_prof_member_create,
                pi_status_t(pi_p4_id_t, const pi_action_data_t *,
@@ -121,8 +142,12 @@ class DummySwitchMock {
   MOCK_METHOD3(action_prof_group_remove_member,
                pi_status_t(pi_p4_id_t, pi_indirect_handle_t,
                            pi_indirect_handle_t));
+  MOCK_METHOD4(action_prof_group_set_members,
+               pi_status_t(pi_p4_id_t, pi_indirect_handle_t,
+                           size_t, const pi_indirect_handle_t *));
   MOCK_METHOD2(action_prof_entries_fetch,
                pi_status_t(pi_p4_id_t, pi_act_prof_fetch_res_t *));
+  MOCK_METHOD0(action_prof_api_support, int());
 
   MOCK_METHOD3(meter_read,
                pi_status_t(pi_p4_id_t, size_t, pi_meter_spec_t *));
@@ -165,6 +190,11 @@ class DummySwitchMock {
                pi_status_t(pi_clone_session_id_t,
                            const pi_clone_session_config_t *));
   MOCK_METHOD1(clone_session_reset, pi_status_t(pi_clone_session_id_t));
+
+  MOCK_METHOD2(learn_config_set,
+               pi_status_t(pi_p4_id_t, const pi_learn_config_t *));
+  MOCK_METHOD2(learn_msg_ack, pi_status_t(pi_p4_id_t, pi_learn_msg_id_t));
+  MOCK_METHOD1(learn_msg_done, pi_status_t(pi_learn_msg_t *));
 
  private:
   std::unique_ptr<DummySwitch> sw;

@@ -20,88 +20,71 @@
 
 #include <PI/pi_learn.h>
 #include <PI/target/pi_learn_imp.h>
+#include "_assert.h"
+#include "pi_learn_int.h"
 
-#include <assert.h>
+#include <pthread.h>
 #include <stdlib.h>
 
-#include "device_map.h"
-#include "vector.h"
+#include "cb_mgr.h"
 
-typedef struct {
-  pi_p4_id_t learn_id;
-  PILearnCb cb;
-  void *cookie;
-} cb_data_t;
+static cb_mgr_t cb_mgr;
+static pthread_mutex_t cb_mutex;
 
-// map of vector_t *
-// hack in the absence of init function
-// TODO(antonin): proper initialization and cleanup, including when a device is
-// assigned / removed
-static device_map_t device_cbs = {NULL};
-
-static PILearnCb default_cb;
-static void *default_cb_cookie;
-
-static cb_data_t *find_cb(pi_dev_id_t dev_id, pi_p4_id_t learn_id) {
-  vector_t *cbs = (vector_t *)device_map_get(&device_cbs, dev_id);
-  if (!cbs) return NULL;
-  cb_data_t *cb_data = vector_data(cbs);
-  size_t num_cbs = vector_size(cbs);
-  for (size_t i = 0; i < num_cbs; i++)
-    if (cb_data[i].learn_id == learn_id) return &cb_data[i];
-  return NULL;
+pi_status_t pi_learn_init() {
+  if (pthread_mutex_init(&cb_mutex, NULL)) return PI_STATUS_PTHREAD_ERROR;
+  cb_mgr_init(&cb_mgr);
+  return PI_STATUS_SUCCESS;
 }
 
-static void add_cb(pi_dev_id_t dev_id, pi_p4_id_t learn_id, PILearnCb cb,
-                   void *cb_cookie) {
-  cb_data_t *cb_data = find_cb(dev_id, learn_id);
-  if (cb_data) {
-    cb_data->cb = cb;
-    cb_data->cookie = cb_cookie;
-    return;
-  }
-  vector_t *cbs = (vector_t *)device_map_get(&device_cbs, dev_id);
-  if (!cbs) {
-    cbs = vector_create(sizeof(cb_data_t), 8);
-    device_map_add(&device_cbs, dev_id, cbs);
-  }
-  cb_data_t new_cb_data = {learn_id, cb, cb_cookie};
-  vector_push_back(cbs, &new_cb_data);
+pi_status_t pi_learn_destroy() {
+  if (pthread_mutex_destroy(&cb_mutex)) return PI_STATUS_PTHREAD_ERROR;
+  cb_mgr_destroy(&cb_mgr);
+  return PI_STATUS_SUCCESS;
 }
 
-static void rm_cb(pi_dev_id_t dev_id, pi_p4_id_t learn_id) {
-  cb_data_t *cb_data = find_cb(dev_id, learn_id);
-  if (!cb_data) return;
-  vector_t *cbs = (vector_t *)device_map_get(&device_cbs, dev_id);
-  assert(cbs);
-  vector_remove_e(cbs, cb_data);
-  if (vector_size(cbs) == 0) {
-    vector_destroy(cbs);
-    device_map_remove(&device_cbs, dev_id);
-  }
+pi_status_t pi_learn_assign_device(pi_dev_id_t dev_id) {
+  (void)dev_id;
+  return PI_STATUS_SUCCESS;
 }
 
-pi_status_t pi_learn_register_cb(pi_dev_id_t dev_id, pi_p4_id_t learn_id,
-                                 PILearnCb cb, void *cb_cookie) {
-  add_cb(dev_id, learn_id, cb, cb_cookie);
+pi_status_t pi_learn_remove_device(pi_dev_id_t dev_id) {
+  return pi_learn_deregister_cb(dev_id);
+}
+
+pi_status_t pi_learn_register_cb(pi_dev_id_t dev_id, PILearnCb cb,
+                                 void *cb_cookie) {
+  pthread_mutex_lock(&cb_mutex);
+  cb_mgr_add(&cb_mgr, dev_id, (GenericFnPtr)cb, cb_cookie);
+  pthread_mutex_unlock(&cb_mutex);
   return PI_STATUS_SUCCESS;
 }
 
 pi_status_t pi_learn_register_default_cb(PILearnCb cb, void *cb_cookie) {
-  default_cb = cb;
-  default_cb_cookie = cb_cookie;
+  pthread_mutex_lock(&cb_mutex);
+  cb_mgr_set_default(&cb_mgr, (GenericFnPtr)cb, cb_cookie);
+  pthread_mutex_unlock(&cb_mutex);
   return PI_STATUS_SUCCESS;
 }
 
-pi_status_t pi_learn_deregister_cb(pi_dev_id_t dev_id, pi_p4_id_t learn_id) {
-  rm_cb(dev_id, learn_id);
+pi_status_t pi_learn_deregister_cb(pi_dev_id_t dev_id) {
+  pthread_mutex_lock(&cb_mutex);
+  cb_mgr_rm(&cb_mgr, dev_id);
+  pthread_mutex_unlock(&cb_mutex);
   return PI_STATUS_SUCCESS;
 }
 
 pi_status_t pi_learn_deregister_default_cb() {
-  default_cb = NULL;
-  default_cb_cookie = NULL;
+  pthread_mutex_lock(&cb_mutex);
+  cb_mgr_reset_default(&cb_mgr);
+  pthread_mutex_unlock(&cb_mutex);
   return PI_STATUS_SUCCESS;
+}
+
+pi_status_t pi_learn_config_set(pi_session_handle_t session_handle,
+                                pi_dev_id_t dev_id, pi_p4_id_t learn_id,
+                                const pi_learn_config_t *config) {
+  return _pi_learn_config_set(session_handle, dev_id, learn_id, config);
 }
 
 pi_status_t pi_learn_msg_ack(pi_session_handle_t session_handle,
@@ -117,14 +100,19 @@ pi_status_t pi_learn_msg_done(pi_learn_msg_t *msg) {
 // called by backend
 pi_status_t pi_learn_new_msg(pi_learn_msg_t *msg) {
   pi_dev_id_t dev_id = msg->dev_tgt.dev_id;
-  cb_data_t *cb_data = find_cb(dev_id, msg->learn_id);
+  pthread_mutex_lock(&cb_mutex);
+  const cb_data_t *cb_data = cb_mgr_get(&cb_mgr, dev_id);
   if (cb_data) {
-    cb_data->cb(msg, cb_data->cookie);
+    ((PILearnCb)(cb_data->cb))(msg, cb_data->cookie);
+    pthread_mutex_unlock(&cb_mutex);
     return PI_STATUS_SUCCESS;
   }
-  if (default_cb) {
-    default_cb(msg, default_cb_cookie);
+  const cb_data_t *default_cb_data = cb_mgr_get_default(&cb_mgr);
+  if (default_cb_data->cb) {
+    ((PILearnCb)(default_cb_data->cb))(msg, default_cb_data->cookie);
+    pthread_mutex_unlock(&cb_mutex);
     return PI_STATUS_SUCCESS;
   }
+  pthread_mutex_unlock(&cb_mutex);
   return PI_STATUS_LEARN_NO_MATCHING_CB;
 }

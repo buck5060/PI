@@ -43,11 +43,9 @@ class DeviceMgrImp;
 class DeviceMgr {
  public:
   using device_id_t = uint64_t;
-  using p4_id_t = uint32_t;
-  // may change when we introduce specific error namespace
   using Status = ::google::rpc::Status;
-  using PacketInCb =
-      std::function<void(device_id_t, p4::v1::PacketIn *packet, void *cookie)>;
+  using StreamMessageResponseCb = std::function<void(
+      device_id_t, p4::v1::StreamMessageResponse *msg, void *cookie)>;
 
   explicit DeviceMgr(device_id_t device_id);
 
@@ -73,9 +71,11 @@ class DeviceMgr {
   Status read_one(const p4::v1::Entity &entity,
                   p4::v1::ReadResponse *response) const;
 
-  Status packet_out_send(const p4::v1::PacketOut &packet) const;
+  Status stream_message_request_handle(
+      const p4::v1::StreamMessageRequest &request);
 
-  void packet_in_register_cb(PacketInCb cb, void *cookie);
+  void stream_message_response_register_cb(StreamMessageResponseCb cb,
+                                           void *cookie);
 
   static void init(size_t max_devices);
 

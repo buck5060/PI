@@ -184,7 +184,7 @@ class DeviceState {
     return device_mgr.get();
   }
 
-  void send_packet_in(p4v1::PacketIn *packet) {
+  void send_stream_message(p4v1::StreamMessageResponse *msg) {
     std::lock_guard<std::mutex> lock(m);
     //Get role_id from packet
     p4v1::PacketMetadata metadata = packet->metadata(1);
@@ -195,21 +195,23 @@ class DeviceState {
     auto connection_role_id = get_by_role_id(role_id);
     if (connection_role_id != nullptr){
       auto stream = connection_role_id->stream();
-      p4v1::StreamMessageResponse response;
-      response.set_allocated_packet(packet);
-      stream->Write(response);
-      response.release_packet();
+      auto success = stream->Write(*msg);
+      if (msg->has_packet() && success) {
+        SIMPLELOG << "PACKET IN\n";
+        pkt_in_count++;
+      }
     } else {
       auto master = get_master();
       if (master == nullptr) return;
       auto stream = master->stream();
-      p4v1::StreamMessageResponse response;
-      response.set_allocated_packet(packet);
-      stream->Write(response);
-      response.release_packet();
+      auto success = stream->Write(*msg);
+      if (msg->has_packet() && success) {
+        SIMPLELOG << "PACKET IN\n";
+        pkt_in_count++;
+      }
     }
 
-    pkt_in_count++;
+    
   }
 
   uint64_t get_pkt_in_count() {
@@ -278,14 +280,18 @@ class DeviceState {
     if (was_master) notify_all();
   }
 
-  void process_packet_out(Connection *connection,
-                          const p4v1::PacketOut &packet_out) {
+  void process_stream_message_request(
+      Connection *connection, const p4v1::StreamMessageRequest &request) {
+    // these are handled directly by StreamChannel
+    assert(request.update_case() != p4v1::StreamMessageRequest::kArbitration);
     std::lock_guard<std::mutex> lock(m);
-    SIMPLELOG << "PACKET OUT\n";
     if (!is_master(connection)) return;
     if (device_mgr == nullptr) return;
-    device_mgr->packet_out_send(packet_out);
-    pkt_out_count++;
+    device_mgr->stream_message_request_handle(request);
+    if (request.update_case() == p4v1::StreamMessageRequest::kPacket) {
+      SIMPLELOG << "PACKET OUT\n";
+      pkt_out_count++;
+    }
   }
 
   uint64_t get_pkt_out_count() {
@@ -400,8 +406,9 @@ class Devices {
                      std::unique_ptr<DeviceState> > device_map{};
 };
 
-void packet_in_cb(DeviceMgr::device_id_t device_id, p4v1::PacketIn *packet,
-                  void *cookie);
+void stream_message_response_cb(DeviceMgr::device_id_t device_id,
+                                p4v1::StreamMessageResponse *msg,
+                                void *cookie);
 
 class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
  private:
@@ -460,8 +467,8 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
     auto device_mgr = device->get_or_add_p4_mgr();
     auto status = device_mgr->pipeline_config_set(
         request->action(), request->config());
-    device_mgr->packet_in_register_cb(packet_in_cb, NULL);
-    // TODO(antonin): multi-device support
+    device_mgr->stream_message_response_register_cb(
+        stream_message_response_cb, NULL);
     return to_grpc_status(status);
   }
 
@@ -535,17 +542,13 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
           }
           break;
         case p4v1::StreamMessageRequest::kPacket:
+        case p4v1::StreamMessageRequest::kDigestAck:
           {
             if (connection_status.connection == nullptr) break;
             auto device_id = connection_status.device_id;
-            Devices::get(device_id)->process_packet_out(
-                connection_status.connection.get(), request.packet());
+            Devices::get(device_id)->process_stream_message_request(
+                connection_status.connection.get(), request);
           }
-          break;
-        case p4v1::StreamMessageRequest::kDigestAck:
-          // DigestAck not supported, and not expected either since we do not
-          // support generating DigestList notifications yet.
-          SIMPLELOG << "DigestAck not supported yet\n";
           break;
         default:
           break;
@@ -559,11 +562,11 @@ class P4RuntimeServiceImpl : public p4v1::P4Runtime::Service {
   }
 };
 
-void packet_in_cb(DeviceMgr::device_id_t device_id, p4v1::PacketIn *packet,
-                  void *cookie) {
+void stream_message_response_cb(DeviceMgr::device_id_t device_id,
+                                p4v1::StreamMessageResponse *msg,
+                                void *cookie) {
   (void) cookie;
-  SIMPLELOG << "PACKET IN\n";
-  Devices::get(device_id)->send_packet_in(packet);
+  Devices::get(device_id)->send_stream_message(msg);
 }
 
 struct ServerData {
@@ -580,7 +583,10 @@ struct ServerData {
 namespace testing {
 
 void send_packet_in(DeviceMgr::device_id_t device_id, p4v1::PacketIn *packet) {
-  packet_in_cb(device_id, packet, nullptr);
+  p4v1::StreamMessageResponse msg;
+  msg.set_allocated_packet(packet);
+  Devices::get(device_id)->send_stream_message(&msg);
+  msg.release_packet();
 }
 
 size_t max_connections() { return DeviceState::max_connections; }

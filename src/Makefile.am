@@ -17,6 +17,8 @@ p4info/counters.c \
 p4info/counters_int.h \
 p4info/meters.c \
 p4info/meters_int.h \
+p4info/digests.c \
+p4info/digests_int.h \
 config_readers/bmv2_json_reader.c \
 config_readers/native_json_reader.c \
 config_readers/readers.h \
@@ -45,7 +47,11 @@ pi_value.c \
 pi_mc.c \
 pi_clone.c \
 device_map.c \
-device_map.h
+device_map.h \
+cb_mgr.c \
+cb_mgr.h \
+pi_tables_int.h \
+pi_learn_int.h
 
 if WITH_INTERNAL_RPC
 libpi_la_SOURCES += \

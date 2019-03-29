@@ -31,7 +31,6 @@
 #include <PI/pi.h>
 #include <PI/proto/util.h>
 
-#include <algorithm>  // for std::all_of
 #include <cstdio>
 #include <limits>
 #include <memory>
@@ -44,10 +43,14 @@
 #include "action_helpers.h"
 #include "action_prof_mgr.h"
 #include "common.h"
+#include "digest_mgr.h"
+#include "idle_timeout_buffer.h"
+#include "match_key_helpers.h"
 #include "packet_io_mgr.h"
 #include "pre_clone_mgr.h"
 #include "pre_mc_mgr.h"
 #include "report_error.h"
+#include "statusor.h"
 #include "table_info_store.h"
 
 #include "p4/tmp/p4config.pb.h"
@@ -64,9 +67,9 @@ namespace fe {
 namespace proto {
 
 using device_id_t = DeviceMgr::device_id_t;
-using p4_id_t = DeviceMgr::p4_id_t;
+using p4_id_t = common::p4_id_t;
 using Status = DeviceMgr::Status;
-using PacketInCb = DeviceMgr::PacketInCb;
+using StreamMessageResponseCb = DeviceMgr::StreamMessageResponseCb;
 using Code = ::google::rpc::Code;
 using common::SessionTemp;
 using common::check_proto_bytestring;
@@ -168,6 +171,11 @@ class P4ErrorReporter {
         auto error_any = status.add_details();
         error_any->PackFrom(p.second);
       }
+      // add trailing OKs
+      for (; i++ < index;) {
+        auto success_any = status.add_details();
+        success_any->PackFrom(success);
+      }
     }
     return status;
   }
@@ -176,20 +184,6 @@ class P4ErrorReporter {
   std::vector<std::pair<size_t, p4v1::Error> > errors{};
   size_t index{0};
 };
-
-bool ternary_match_is_dont_care(const p4v1::FieldMatch::Ternary &mf) {
-  const auto &mask = mf.mask();
-  return std::all_of(mask.begin(), mask.end(),
-                     [](std::string::value_type c) { return c == 0; });
-}
-
-bool range_match_is_dont_care(const p4v1::FieldMatch::Range &mf) {
-  const auto &low = mf.low();
-  const auto &high = mf.high();
-  auto bitwidth = static_cast<size_t>(low.size() * 8);
-  return low == common::range_default_lo(bitwidth) &&
-      high == common::range_default_hi(bitwidth);
-}
 
 struct OneShotCleanup : public common::LocalCleanupIface {
   OneShotCleanup(ActionProfMgr *action_prof_mgr,
@@ -296,15 +290,32 @@ class DeviceMgrImp {
   explicit DeviceMgrImp(device_id_t device_id)
       : device_id(device_id),
         device_tgt({static_cast<pi_dev_id_t>(device_id), 0xffff}),
-        packet_io(device_id) { }
+        packet_io(device_id),
+        digest_mgr(device_id),
+        idle_timeout_buffer(device_id, &table_info_store) { }
 
   ~DeviceMgrImp() {
     pi_remove_device(device_id);
   }
 
+  DeviceMgrImp(const DeviceMgrImp &) = delete;
+  DeviceMgrImp &operator=(const DeviceMgrImp &) = delete;
+  DeviceMgrImp(DeviceMgrImp &&) = delete;
+  DeviceMgrImp &operator=(DeviceMgrImp &&) = delete;
+
   Status p4_change(const p4v1::ForwardingPipelineConfig &config_proto_new,
                    pi_p4info_t *p4info_new) {
     const auto &p4info_proto_new = config_proto_new.p4info();
+
+    // needs to happen before we start modifying the table store
+    // the p4_change call will block until all pending notifications have been
+    // processed; at this stage we assume no more notifications are received
+    // from the target (since the pi_update_device_start call has returned)
+    // until the pi_update_device_end call is made.
+    idle_timeout_buffer.p4_change(p4info_new);
+
+    SessionTemp session(false  /* = batch */);
+
     table_info_store.reset();
     for (auto t_id = pi_p4info_table_begin(p4info_new);
          t_id != pi_p4info_table_end(p4info_new);
@@ -333,16 +344,36 @@ class DeviceMgrImp {
       // yet.
       table_info_store.add_entry(
           t_id, match_key,
-          TableInfoStore::Data(0  /* handle */, 0  /* controller_metadata */, 0 /* role_id */)
-          );
+          TableInfoStore::Data(0  /* handle */,
+                               0  /* controller_metadata */,
+                               0  /* idle_timeout_ns */,
+                               0  /* role_id */));
+
+      // if idle timeout is supported, set min TTL
+      if (pi_p4info_table_supports_idle_timeout(p4info_new, t_id)) {
+        // we assume this is a reasonnable value for targets; concretely this
+        // means that we don't expect the PI target to be able to support TTLs
+        // under 500ms.
+        constexpr uint64_t kIdleTimeoutMinTtlNs = 500 * 1000 * 1000;  // 500ms
+        pi_idle_timeout_config_t config = {kIdleTimeoutMinTtlNs};
+        auto pi_status = pi_table_idle_timeout_config_set(
+            session.get(), device_id, t_id, &config);
+        if (pi_status != PI_STATUS_SUCCESS) {
+          // TODO(antonin): return error code?
+          Logger::get()->error("Failed to configure idle timeout on target");
+        }
+      }
     }
 
     action_profs.clear();
+    // TODO(antonin): use something like Google's ASSIGN_OR_RETURN
+    auto pi_api_choice = ActionProfMgr::choose_pi_api(device_id);
+    RETURN_IF_ERROR(pi_api_choice.status());
     for (auto act_prof_id = pi_p4info_act_prof_begin(p4info_new);
          act_prof_id != pi_p4info_act_prof_end(p4info_new);
          act_prof_id = pi_p4info_act_prof_next(p4info_new, act_prof_id)) {
-      std::unique_ptr<ActionProfMgr> mgr(
-          new ActionProfMgr(device_tgt, act_prof_id, p4info_new));
+      std::unique_ptr<ActionProfMgr> mgr(new ActionProfMgr(
+          device_tgt, act_prof_id, p4info_new, pi_api_choice.ValueOrDie()));
       action_profs.emplace(act_prof_id, std::move(mgr));
     }
 
@@ -351,6 +382,8 @@ class DeviceMgrImp {
     pre_mc_mgr.reset(pre_mc_mgr_);
 
     packet_io.p4_change(p4info_proto_new);
+
+    digest_mgr.p4_change(p4info_proto_new);
 
     // we do this last, so that the ActProfMgr instances never point to an
     // invalid p4info, even though this is not strictly required here
@@ -573,11 +606,15 @@ class DeviceMgrImp {
     if (!check_p4_id(table_entry.table_id(), P4Ids::TABLE))
       return make_invalid_p4_id_status();
 
-    Status status;
+    if (table_entry.has_time_since_last_hit()) {
+      RETURN_ERROR_STATUS(
+          Code::INVALID_ARGUMENT,
+          "has_time_since_last_hit must not be set in WriteRequest");
+    }
+
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        status.set_code(Code::INVALID_ARGUMENT);
-        break;
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         return table_insert(table_entry, role_id, is_master, session);
       case p4v1::Update::MODIFY:
@@ -585,10 +622,10 @@ class DeviceMgrImp {
       case p4v1::Update::DELETE:
         return table_delete(table_entry, role_id, is_master, session);
       default:
-        status.set_code(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
         break;
     }
-    return status;
+    RETURN_OK_STATUS();  // unreachable
   }
 
   Status meter_write(p4v1::Update::Type update,
@@ -608,7 +645,7 @@ class DeviceMgrImp {
     auto index = static_cast<size_t>(meter_entry.index().index());
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
                             "INSERT update type not supported for meters");
@@ -639,7 +676,7 @@ class DeviceMgrImp {
         }
         break;
       default:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
     }
     RETURN_OK_STATUS();
   }
@@ -692,7 +729,7 @@ class DeviceMgrImp {
     }
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
                             "INSERT update type not supported for meters");
@@ -727,7 +764,7 @@ class DeviceMgrImp {
         }
         break;
       default:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
     }
     RETURN_OK_STATUS();
   }
@@ -789,7 +826,7 @@ class DeviceMgrImp {
   Status direct_meter_read_one(const p4v1::TableEntry &table_entry,
                                const SessionTemp &session,
                                p4v1::ReadResponse *response) const {
-    if (table_entry.match_size() > 0) {
+    if (!table_entry.match().empty()) {
       auto table_lock = table_info_store.lock_table(table_entry.table_id());
 
       pi_entry_handle_t entry_handle = 0;
@@ -844,79 +881,8 @@ class DeviceMgrImp {
     return direct_meter_read_one(table_entry, session, response);
   }
 
-  Code parse_match_key(p4_id_t table_id, const pi_match_key_t *match_key,
-                       p4v1::TableEntry *entry) const {
-    auto num_match_fields = pi_p4info_table_num_match_fields(
-        p4info.get(), table_id);
-    MatchKeyReader mk_reader(match_key);
-    auto priority = mk_reader.get_priority();
-    if (priority > 0) entry->set_priority(priority);
-    for (size_t j = 0; j < num_match_fields; j++) {
-      auto finfo = pi_p4info_table_match_field_info(p4info.get(), table_id, j);
-      auto mf = entry->add_match();
-      mf->set_field_id(finfo->mf_id);
-      switch (finfo->match_type) {
-        // For backward-compatibility with the old workflow (P4_14 program ---
-        // p4c-bm compiler ---> bmv2 JSON --- converter ---> P4Info), we still
-        // support PI_P4INFO_MATCH_TYPE_VALID. The P4_14 valid match type will
-        // show up as exact in the P4Info, which is why we set the exact field
-        // in the P4Runtime message (to '\x01' for valid and '\x00' for
-        // invalid).
-        case PI_P4INFO_MATCH_TYPE_VALID:
-          {
-            auto exact = mf->mutable_exact();
-            bool value;
-            mk_reader.get_valid(finfo->mf_id, &value);
-            exact->set_value(
-                value ? std::string("\x01", 1) : std::string("\x00", 1));
-          }
-          break;
-        case PI_P4INFO_MATCH_TYPE_EXACT:
-          {
-            auto exact = mf->mutable_exact();
-            mk_reader.get_exact(finfo->mf_id, exact->mutable_value());
-          }
-          break;
-        case PI_P4INFO_MATCH_TYPE_LPM:
-          {
-            auto lpm = mf->mutable_lpm();
-            int pLen;
-            mk_reader.get_lpm(finfo->mf_id, lpm->mutable_value(), &pLen);
-            lpm->set_prefix_len(pLen);
-            // if prefix length is 0, omit match field
-            if (pLen == 0)
-              entry->mutable_match()->RemoveLast();
-          }
-          break;
-        case PI_P4INFO_MATCH_TYPE_TERNARY:
-          {
-            auto ternary = mf->mutable_ternary();
-            mk_reader.get_ternary(finfo->mf_id, ternary->mutable_value(),
-                                  ternary->mutable_mask());
-            // if mask is 0, omit match field
-            if (ternary_match_is_dont_care(*ternary))
-              entry->mutable_match()->RemoveLast();
-          }
-          break;
-        case PI_P4INFO_MATCH_TYPE_RANGE:
-          {
-            auto range = mf->mutable_range();
-            mk_reader.get_range(finfo->mf_id, range->mutable_low(),
-                                range->mutable_high());
-            // if range includes all values, omit match field
-            if (range_match_is_dont_care(*range))
-              entry->mutable_match()->RemoveLast();
-          }
-          break;
-        default:
-          return Code::UNKNOWN;
-      }
-    }
-    return Code::OK;
-  }
-
-  Code parse_action_data(const pi_action_data_t *pi_action_data,
-                         p4v1::Action *action) const {
+  Status parse_action_data(const pi_action_data_t *pi_action_data,
+                           p4v1::Action *action) const {
     ActionDataReader reader(pi_action_data);
     auto action_id = reader.get_action_id();
     action->set_action_id(action_id);
@@ -928,17 +894,17 @@ class DeviceMgrImp {
       param->set_param_id(param_ids[j]);
       reader.get_arg(param_ids[j], param->mutable_value());
     }
-    return Code::OK;
+    RETURN_OK_STATUS();
   }
 
-  Code parse_action_entry(
+  Status parse_action_entry(
       p4_id_t table_id,
       const pi_table_entry_t *pi_entry,
       p4v1::TableEntry *entry,
       const std::unordered_map<
         pi_indirect_handle_t,
         p4v1::ActionProfileActionSet> &oneshot_map) const {
-    if (pi_entry->entry_type == PI_ACTION_ENTRY_TYPE_NONE) return Code::OK;
+    if (pi_entry->entry_type == PI_ACTION_ENTRY_TYPE_NONE) RETURN_OK_STATUS();
 
     auto table_action = entry->mutable_action();
     if (pi_entry->entry_type == PI_ACTION_ENTRY_TYPE_INDIRECT) {
@@ -946,31 +912,35 @@ class DeviceMgrImp {
       auto action_prof_id = pi_p4info_table_get_implementation(p4info.get(),
                                                                table_id);
       // check that table is indirect
-      if (action_prof_id == PI_INVALID_ID) return Code::UNKNOWN;
+      if (action_prof_id == PI_INVALID_ID) {
+        RETURN_ERROR_STATUS(Code::INTERNAL,
+                            "No implementation found for indirect table");
+      }
       auto action_prof_mgr = get_action_prof_mgr(action_prof_id);
       switch (action_prof_mgr->get_selector_usage()) {
         case ActionProfMgr::SelectorUsage::UNSPECIFIED:
-          return Code::INTERNAL;
+          RETURN_ERROR_STATUS(Code::INTERNAL, "Invalid selector mode");
         case ActionProfMgr::SelectorUsage::ONESHOT:
           {
             auto p_it = oneshot_map.find(indirect_h);
-            if (p_it == oneshot_map.end()) return Code::INTERNAL;
+            if (p_it == oneshot_map.end())
+              RETURN_ERROR_STATUS(Code::INTERNAL, "Invalid group handle");
             table_action->mutable_action_profile_action_set()->CopyFrom(
                 p_it->second);
-            return Code::OK;
+            RETURN_OK_STATUS();
           }
         case ActionProfMgr::SelectorUsage::MANUAL:
           {
             ActionProfMgr::Id member_id;
             if (action_prof_mgr->retrieve_member_id(indirect_h, &member_id)) {
               table_action->set_action_profile_member_id(member_id);
-              return Code::OK;
+              RETURN_OK_STATUS();
             }
             ActionProfMgr::Id group_id;
             if (!action_prof_mgr->retrieve_group_id(indirect_h, &group_id))
-              return Code::INTERNAL;
+              RETURN_ERROR_STATUS(Code::INTERNAL, "Invalid indirect handle");
             table_action->set_action_profile_group_id(group_id);
-            return Code::OK;
+            RETURN_OK_STATUS();
           }
       }
     }
@@ -1019,8 +989,7 @@ class DeviceMgrImp {
       auto p = mbr_h_to_action.emplace(member_h, p4v1::Action());
       if (!p.second)
         RETURN_ERROR_STATUS(Code::INTERNAL, "Duplicate member handle");
-      if (parse_action_data(action_data, &p.first->second) != Code::OK)
-        RETURN_ERROR_STATUS(Code::INTERNAL, "Error when parsing action data");
+      RETURN_IF_ERROR(parse_action_data(action_data, &p.first->second));
     }
 
     // then, iterate over groups and build the corresponding
@@ -1051,13 +1020,50 @@ class DeviceMgrImp {
         auto action_spec_it = mbr_h_to_action.find(members_h_in_order[j]);
         if (action_spec_it == mbr_h_to_action.end())
           RETURN_ERROR_STATUS(Code::INTERNAL, "Invalid member handle in group");
-        // TODO(antonin): watch & weigth?
         ap_action->mutable_action()->CopyFrom(action_spec_it->second);
+        // TODO(antonin): support arbitrary weight
+        // We set the weight to 1 unconditionally in every read response,
+        // because this is the only value we currently support and the only
+        // value we accept in write requests.
+        ap_action->set_weight(1);
+        // TODO(antonin): support watch
       }
     }
 
     pi_act_prof_entries_fetch_done(session.get(), res);
 
+    RETURN_OK_STATUS();
+  }
+
+  // Query the remaining TTL value from the target and deduce the
+  // "time_since_last_hit". This should be called when processing a ReadRequest
+  // for a TableEntry where the "time_since_last_hit" message field is set, and
+  // only if the P4 table actually supports entry ageing.
+  Status set_time_since_last_hit(p4_id_t table_id,
+                                 pi_entry_handle_t entry_handle,
+                                 p4v1::TableEntry *table_entry,
+                                 int64_t idle_timeout_ns,
+                                 const SessionTemp &session) const {
+    auto *time_since_last_hit = table_entry->mutable_time_since_last_hit();
+    if (idle_timeout_ns == 0) {
+      // TODO(antonin): This violates the spec, which states that we should
+      // populate the correct value even for entries for which ageing is
+      // disabled, but PI currently doesn't provide us with this information.
+      time_since_last_hit->set_elapsed_ns(0);
+    } else {
+      uint64_t remaining_ttl_ns = 0;
+      auto pi_status = pi_table_entry_get_remaining_ttl(
+          session.get(), device_id, table_id, entry_handle, &remaining_ttl_ns);
+      if (pi_status != PI_STATUS_SUCCESS) {
+        RETURN_ERROR_STATUS(
+            Code::UNKNOWN,
+            "Error when reading remaining entry TTL from target");
+      }
+      auto remaining_ttl_ns_ = static_cast<int64_t>(remaining_ttl_ns);
+      time_since_last_hit->set_elapsed_ns(
+          (idle_timeout_ns >= remaining_ttl_ns_) ?
+          (idle_timeout_ns - remaining_ttl_ns_) : 0);
+    }
     RETURN_OK_STATUS();
   }
 
@@ -1067,13 +1073,13 @@ class DeviceMgrImp {
                         const SessionTemp &session,
                         p4v1::ReadResponse *response) const {
     pi::MatchKey expected_match_key(p4info.get(), table_id);
-    if (requested_entry.match_size() > 0) {
-      if (requested_entry.is_default_action()) {
-        RETURN_ERROR_STATUS(Code::UNIMPLEMENTED,
-                            "Reading default entry not supported yet");
-      }
-      auto status = construct_match_key(requested_entry, &expected_match_key);
-      if (IS_ERROR(status)) return status;
+    if (requested_entry.is_default_action()) {
+      RETURN_ERROR_STATUS(Code::UNIMPLEMENTED,
+                          "Reading default entry not supported yet");
+    }
+    if (!requested_entry.match().empty()) {
+      RETURN_IF_ERROR(
+          construct_match_key(requested_entry, &expected_match_key));
     }
 
     std::unordered_map<pi_indirect_handle_t,
@@ -1082,6 +1088,16 @@ class DeviceMgrImp {
     // oneshot programming method, to guarantee read-write symmetry
     RETURN_IF_ERROR(build_action_profile_action_set_map(
         table_id, &oneshot_map, session));
+
+    bool table_supports_idle_timeout = pi_p4info_table_supports_idle_timeout(
+        p4info.get(), table_id);
+    if (requested_entry.has_time_since_last_hit() &&
+        !table_supports_idle_timeout) {
+      RETURN_ERROR_STATUS(
+          Code::INVALID_ARGUMENT,
+          "Do not set time_since_last_hit for a ReadRequest if the table "
+          "does not support idle timeout; yes, that includes wildcard reads");
+    }
 
     pi_table_fetch_res_t *res;
     auto table_lock = table_info_store.lock_table(table_id);
@@ -1094,7 +1110,6 @@ class DeviceMgrImp {
     auto num_entries = pi_table_entries_num(res);
     pi_table_ma_entry_t entry;
     pi_entry_handle_t entry_handle;
-    Code code = Code::OK;
     pi::MatchKey mk(p4info.get(), table_id);
     for (size_t i = 0; i < num_entries; i++) {
       pi_table_entries_next(res, &entry, &entry_handle);
@@ -1110,7 +1125,7 @@ class DeviceMgrImp {
       // format and I use this for the lookup. If this is a performance issue,
       // we can find a better solution.
       mk.from(entry.match_key);
-      if (requested_entry.match_size() > 0 &&
+      if (!requested_entry.match().empty() &&
           !pi::MatchKeyEq()(mk, expected_match_key)) {
         continue;
       }
@@ -1125,11 +1140,9 @@ class DeviceMgrImp {
       
       auto *table_entry = response->add_entities()->mutable_table_entry();
       table_entry->set_table_id(table_id);
-      code = parse_match_key(table_id, entry.match_key, table_entry);
-      if (code != Code::OK) break;
-      code = parse_action_entry(table_id, &entry.entry, table_entry,
-                                oneshot_map);
-      if (code != Code::OK) break;
+      RETURN_IF_ERROR(parse_match_key(p4info.get(), table_id, mk, table_entry));
+      RETURN_IF_ERROR(
+          parse_action_entry(table_id, &entry.entry, table_entry, oneshot_map));
 
       // direct resources
       auto *direct_configs = entry.entry.direct_res_config;
@@ -1137,17 +1150,15 @@ class DeviceMgrImp {
         for (size_t j = 0; j < direct_configs->num_configs; j++) {
           const auto &config = direct_configs->configs[j];
           if (pi_is_direct_counter_id(config.res_id)) {
-            // TODO(antonin): according to a p4runtime.proto comment, we are
-            // supposed to include counter data if the table has a direct
-            // counter, irrespective of whether or not the counter_data field
-            // was set. However, it breaks some existing unit tests, so we use
-            // this if statement for the moment.
             if (requested_entry.has_counter_data()) {
               counter_data_pi_to_proto(
                   *static_cast<pi_counter_data_t *>(config.config),
                   table_entry->mutable_counter_data());
             }
           } else if (pi_is_direct_meter_id(config.res_id)) {
+            // TODO(antonin): according to the P4Runtime spec, we are not
+            // supposed to to set meter_config if the meter is in its default
+            // configuration (all packets green).
             if (requested_entry.has_meter_config()) {
               meter_spec_pi_to_proto(
                   *static_cast<pi_meter_spec_t *>(config.config),
@@ -1175,6 +1186,13 @@ class DeviceMgrImp {
                             "Table state out-of-sync with target");
       }
       table_entry->set_controller_metadata(entry_data->controller_metadata);
+      table_entry->set_idle_timeout_ns(entry_data->idle_timeout_ns);
+
+      if (requested_entry.has_time_since_last_hit()) {
+        RETURN_IF_ERROR(set_time_since_last_hit(
+            table_id, entry_handle, table_entry, entry_data->idle_timeout_ns,
+            session));
+      }
 
       // just a sanity check
       assert(
@@ -1185,7 +1203,7 @@ class DeviceMgrImp {
 
     pi_table_entries_fetch_done(session.get(), res);
 
-    RETURN_STATUS(code);
+    RETURN_OK_STATUS();
   }
 
   // TODO(antonin): full filtering on the match key, action, ... as per the spec
@@ -1230,7 +1248,7 @@ class DeviceMgrImp {
     }
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         return action_prof_mgr->member_create(member, session);
       case p4v1::Update::MODIFY:
@@ -1238,10 +1256,10 @@ class DeviceMgrImp {
       case p4v1::Update::DELETE:
         return action_prof_mgr->member_delete(member, session);
       default:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
     }
     assert(0);
-    RETURN_ERROR_STATUS(Code::UNKNOWN);  // UNREACHABLE
+    RETURN_ERROR_STATUS(Code::INTERNAL);  // UNREACHABLE
   }
 
   Status action_profile_group_write(p4v1::Update::Type update,
@@ -1257,7 +1275,7 @@ class DeviceMgrImp {
     }
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         return action_prof_mgr->group_create(group, session);
       case p4v1::Update::MODIFY:
@@ -1265,10 +1283,10 @@ class DeviceMgrImp {
       case p4v1::Update::DELETE:
         return action_prof_mgr->group_delete(group, session);
       default:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
     }
     assert(0);
-    RETURN_ERROR_STATUS(Code::UNKNOWN);  // UNREACHABLE
+    RETURN_ERROR_STATUS(Code::INTERNAL);  // UNREACHABLE
   }
 
   template <typename T, typename MemberAccessor, typename GroupAccessor>
@@ -1300,8 +1318,7 @@ class DeviceMgrImp {
       if (member == nullptr) break;
       member->set_action_profile_id(action_profile_id);
       pi_act_prof_mbrs_next(res, &action_data, &member_h);
-      code = parse_action_data(action_data, member->mutable_action());
-      if (code != Code::OK) break;
+      RETURN_IF_ERROR(parse_action_data(action_data, member->mutable_action()));
       ActionProfMgr::Id member_id;
       if (!action_prof_mgr->retrieve_member_id(member_h, &member_id)) {
         RETURN_ERROR_STATUS(Code::INTERNAL,
@@ -1333,6 +1350,12 @@ class DeviceMgrImp {
         }
         auto member = group->add_members();
         member->set_member_id(member_id);
+        // TODO(antonin): support arbitrary weight
+        // We set the weight to 1 unconditionally in every read response,
+        // because this is the only value we currently support and the only
+        // value we accept in write requests.
+        member->set_weight(1);
+        // TODO(antonin): support watch
       }
     }
 
@@ -1411,8 +1434,31 @@ class DeviceMgrImp {
     return packet_io.packet_out_send(packet);
   }
 
-  void packet_in_register_cb(PacketInCb cb, void *cookie) {
-    packet_io.packet_in_register_cb(std::move(cb), cookie);
+  Status stream_message_request_handle(
+      const p4::v1::StreamMessageRequest &request) {
+    switch (request.update_case()) {
+      case p4v1::StreamMessageRequest::kArbitration:
+        // must be handled by server code
+        RETURN_ERROR_STATUS(
+            Code::INTERNAL, "Arbitration mesages must be handled by server");
+      case p4v1::StreamMessageRequest::kPacket:
+        return packet_io.packet_out_send(request.packet());
+      case p4v1::StreamMessageRequest::kDigestAck:
+        digest_mgr.ack(request.digest_ack());
+        RETURN_OK_STATUS();
+      default:
+        RETURN_ERROR_STATUS(
+            Code::INVALID_ARGUMENT, "Invalid stream message request type");
+    }
+    assert(0);
+    RETURN_ERROR_STATUS(Code::INTERNAL);  // unreachable
+  }
+
+  void stream_message_response_register_cb(StreamMessageResponseCb cb,
+                                           void *cookie) {
+    idle_timeout_register_cb(cb, cookie);
+    packet_io.packet_in_register_cb(cb, cookie);
+    digest_mgr.stream_message_response_register_cb(cb, cookie);
   }
 
   Status counter_write(p4v1::Update::Type update,
@@ -1432,7 +1478,7 @@ class DeviceMgrImp {
     auto index = static_cast<size_t>(counter_entry.index().index());
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
                             "INSERT update type not supported for counters");
@@ -1461,7 +1507,7 @@ class DeviceMgrImp {
         }
         break;
       default:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
     }
     RETURN_OK_STATUS();
   }
@@ -1497,7 +1543,7 @@ class DeviceMgrImp {
     }
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
                             "INSERT update type not supported for counters");
@@ -1530,7 +1576,7 @@ class DeviceMgrImp {
         }
         break;
       default:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
     }
     RETURN_OK_STATUS();
   }
@@ -1600,7 +1646,7 @@ class DeviceMgrImp {
   Status direct_counter_read_one(const p4v1::TableEntry &table_entry,
                                  const SessionTemp &session,
                                  p4v1::ReadResponse *response) const {
-    if (table_entry.match_size() > 0) {
+    if (!table_entry.match().empty()) {
       auto table_lock = table_info_store.lock_table(table_entry.table_id());
 
       pi_entry_handle_t entry_handle = 0;
@@ -1664,7 +1710,7 @@ class DeviceMgrImp {
     }
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         return pre_mc_mgr->group_create(mc_group_entry);
       case p4v1::Update::MODIFY:
@@ -1674,7 +1720,7 @@ class DeviceMgrImp {
       default:
         break;
     }
-    RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid PRE update type");
+    RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
   }
 
   Status pre_clone_write(p4v1::Update::Type update,
@@ -1682,7 +1728,7 @@ class DeviceMgrImp {
                          const SessionTemp &session) {
     switch (update) {
       case p4v1::Update::UNSPECIFIED:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Update type is not set");
       case p4v1::Update::INSERT:
         return pre_clone_mgr->session_create(clone_session_entry, session);
       case p4v1::Update::MODIFY:
@@ -1692,7 +1738,7 @@ class DeviceMgrImp {
       default:
         break;
     }
-    RETURN_OK_STATUS();
+    RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid update type");
   }
 
   Status pre_write(p4v1::Update::Type update,
@@ -1781,8 +1827,7 @@ class DeviceMgrImp {
                               "Register reads are not supported yet");
         break;
       case p4v1::Entity::kDigestEntry:
-        status = ERROR_STATUS(Code::UNIMPLEMENTED,
-                              "Digest config reads are not supported yet");
+        status = digest_mgr.config_read(entity.digest_entry(), response);
         break;
       default:
         status = ERROR_STATUS(Code::UNKNOWN, "Incorrect entity type");
@@ -1868,8 +1913,8 @@ class DeviceMgrImp {
                                 "Register writes are not supported yet");
           break;
         case p4v1::Entity::kDigestEntry:
-          status = ERROR_STATUS(Code::UNIMPLEMENTED,
-                                "Digest config writes are not supported yet");
+          status = digest_mgr.config_write(
+              entity.digest_entry(), update.type(), session);
           break;
         default:
           status = ERROR_STATUS(Code::UNKNOWN, "Incorrect entity type");
@@ -2159,13 +2204,70 @@ class DeviceMgrImp {
     RETURN_OK_STATUS();
   }
 
-  Status construct_action_data(uint32_t table_id, const p4v1::Action &action,
-                               pi::ActionEntry *action_entry) const {
-    auto action_id = action.action_id();
+  // Called in table_insert & table_modify
+  Status validate_action(const p4v1::TableEntry &entry) const {
+    const auto table_id = entry.table_id();
+    const auto &table_action = entry.action();
+    auto action_prof_id = pi_p4info_table_get_implementation(p4info.get(),
+                                                             table_id);
+    auto table_is_indirect = (action_prof_id != PI_INVALID_ID);
+    if (table_is_indirect && entry.is_default_action()) {
+      RETURN_ERROR_STATUS(
+          Code::INVALID_ARGUMENT,
+          "Cannot set / reset default action for indirect table {}", table_id);
+    }
+    if (entry.is_default_action() &&
+        pi_p4info_table_has_const_default_action(p4info.get(), table_id)) {
+      RETURN_ERROR_STATUS(
+          Code::PERMISSION_DENIED,
+          "Cannot set / reset default action for table {} which has a const "
+          "default action", table_id);
+    }
+    if (!entry.has_action()) RETURN_OK_STATUS();
+    if (table_is_indirect &&
+        table_action.type_case() == p4v1::TableAction::kAction) {
+      RETURN_ERROR_STATUS(
+          Code::INVALID_ARGUMENT,
+          "Cannot provide direct action for indirect table {}", table_id);
+    }
+    if (!table_is_indirect &&
+        table_action.type_case() != p4v1::TableAction::kAction) {
+      RETURN_ERROR_STATUS(
+          Code::INVALID_ARGUMENT,
+          "Cannot provide indirect action for direct table {}", table_id);
+    }
+    // The PSA spec & the P4Runtime spec specify that tables with an action
+    // profile implementation cannot define a default action, which means that
+    // the rest of the checks are meaningless for indirect tables.
+    if (table_is_indirect) RETURN_OK_STATUS();
+    auto action_id = table_action.action().action_id();
     if (!check_p4_id(action_id, P4Ids::ACTION))
       return make_invalid_p4_id_status();
-    if (!pi_p4info_table_is_action_of(p4info.get(), table_id, action_id))
+    auto action_info = pi_p4info_table_get_action_info(
+        p4info.get(), table_id, action_id);
+    if (!action_info)
       RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "Invalid action for table");
+    // most common case
+    if (action_info->scope == PI_P4INFO_ACTION_SCOPE_TABLE_AND_DEFAULT)
+      RETURN_OK_STATUS();
+    if (action_info->scope == PI_P4INFO_ACTION_SCOPE_TABLE_ONLY &&
+        entry.is_default_action()) {
+      RETURN_ERROR_STATUS(
+          Code::PERMISSION_DENIED,
+          "Cannot use TABLE_ONLY action as default action");
+    }
+    if (action_info->scope == PI_P4INFO_ACTION_SCOPE_DEFAULT_ONLY &&
+        !entry.is_default_action()) {
+      RETURN_ERROR_STATUS(
+          Code::PERMISSION_DENIED,
+          "Cannot use DEFAULT_ONLY action in table entry");
+    }
+    RETURN_OK_STATUS();
+  }
+
+  Status construct_action_data(uint32_t table_id, const p4v1::Action &action,
+                               pi::ActionEntry *action_entry) const {
+    (void) table_id;
     auto status = validate_action_data(p4info.get(), action);
     if (IS_ERROR(status)) return status;
     action_entry->init_action_data(p4info.get(), action.action_id());
@@ -2181,12 +2283,8 @@ class DeviceMgrImp {
                                          pi::ActionEntry *action_entry) {
     auto action_prof_id = pi_p4info_table_get_implementation(p4info.get(),
                                                              table_id);
-    // check that table is indirect
-    if (action_prof_id == PI_INVALID_ID) {
-      RETURN_ERROR_STATUS(
-          Code::INVALID_ARGUMENT,
-          "Expected indirect table but table {} is not", table_id);
-    }
+    // validate_action checked that table was indirect
+    assert(action_prof_id != PI_INVALID_ID);
     auto action_prof_mgr = get_action_prof_mgr(action_prof_id);
     // cannot assert because the action prof id is provided by the PI
     assert(action_prof_mgr);
@@ -2230,7 +2328,8 @@ class DeviceMgrImp {
         RETURN_ERROR_STATUS(Code::INTERNAL,
                             "Unexpected call to construct_action_entry");
       default:
-        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT);
+        RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
+                            "Invalid table action type");
     }
   }
 
@@ -2241,12 +2340,8 @@ class DeviceMgrImp {
       SessionTemp *session) {
     auto action_prof_id = pi_p4info_table_get_implementation(p4info.get(),
                                                              table_id);
-    // check that table is indirect
-    if (action_prof_id == PI_INVALID_ID) {
-      RETURN_ERROR_STATUS(
-          Code::INVALID_ARGUMENT,
-          "Expected indirect table but table {} is not", table_id);
-    }
+    // validate_action checked that table was indirect
+    assert(action_prof_id != PI_INVALID_ID);
     auto action_prof_mgr = get_action_prof_mgr(action_prof_id);
     // cannot assert because the action prof id is provided by the PI
     assert(action_prof_mgr);
@@ -2303,6 +2398,37 @@ class DeviceMgrImp {
     RETURN_OK_STATUS();
   }
 
+  // returns true if table supports idle timeout.
+  // returns an error if idle_timeout_ns is not valid.
+  StatusOr<bool> validate_entry_ttl(const p4v1::TableEntry &table_entry) {
+    if (table_entry.idle_timeout_ns() < 0) {
+      RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT,
+                          "idle_timeout_ns must be a positive value");
+    }
+    bool supports_idle_timeout = pi_p4info_table_supports_idle_timeout(
+        p4info.get(), table_entry.table_id());
+    if (table_entry.idle_timeout_ns() > 0 && !supports_idle_timeout) {
+      RETURN_ERROR_STATUS(
+          Code::INVALID_ARGUMENT,
+          "idle_timeout_ns must be set to 0 for tables which do not support "
+          "idle timeout");
+    }
+    return supports_idle_timeout;
+  }
+
+  // call this only if validate_entry_ttl succeeds and returns true.
+  // we only set the ttl in the PI table entry if it's an INSERT of if it's a
+  // MODIFY and the new value is different from the old one.
+  void set_entry_ttl(const p4v1::TableEntry &table_entry,
+                     pi::ActionEntry *action_entry,
+                     int64_t *previous_ttl  /* nullptr for INSERT */) {
+    if (previous_ttl == nullptr ||
+        (*previous_ttl != table_entry.idle_timeout_ns())) {
+      action_entry->set_ttl(
+          static_cast<uint64_t>(table_entry.idle_timeout_ns()));
+    }
+  }
+
   Status table_insert(const p4v1::TableEntry &table_entry,
                       const uint64_t role_id,
                       bool is_master,
@@ -2318,11 +2444,16 @@ class DeviceMgrImp {
                           "Not Shared Table or Not Master");
     }
 
+    if (!table_entry.has_action())
+      RETURN_ERROR_STATUS(Code::INVALID_ARGUMENT, "'action' field must be set");
+
     pi::MatchKey match_key(p4info.get(), table_id);
     {
       auto status = construct_match_key(table_entry, &match_key);
       if (IS_ERROR(status)) return status;
     }
+
+    RETURN_IF_ERROR(validate_action(table_entry));
 
     pi::ActionEntry action_entry;
     pi_meter_spec_t _meter_spec_storage;
@@ -2342,6 +2473,11 @@ class DeviceMgrImp {
     RETURN_IF_ERROR(construct_direct_resources(
         table_entry, &action_entry,
         &_meter_spec_storage, &_counter_data_storage));
+
+    StatusOr<bool> supports_idle_timeout = validate_entry_ttl(table_entry);
+    RETURN_IF_ERROR(supports_idle_timeout.status());
+    if (supports_idle_timeout.ValueOrDie())
+      set_entry_ttl(table_entry, &action_entry, nullptr);
 
     auto table_lock = table_info_store.lock_table(table_id);
 
@@ -2364,12 +2500,15 @@ class DeviceMgrImp {
       table_info_store.add_entry(
           table_id, match_key,
           TableInfoStore::Data(handle, table_entry.controller_metadata(),
-                               action_entry.indirect_handle(), role_id));
+                               table_entry.idle_timeout_ns(),
+                               action_entry.indirect_handle(),
+                               role_id));
       session->cleanup_scope_pop();
     } else {
       table_info_store.add_entry(
           table_id, match_key,
-          TableInfoStore::Data(handle, table_entry.controller_metadata(), role_id));
+          TableInfoStore::Data(handle, table_entry.controller_metadata(),
+                               table_entry.idle_timeout_ns(), role_id));
     }
 
     RETURN_OK_STATUS();
@@ -2390,6 +2529,8 @@ class DeviceMgrImp {
       RETURN_ERROR_STATUS(Code::PERMISSION_DENIED,
                           "Not Shared Table or Not Master");
     }
+
+    RETURN_IF_ERROR(validate_action(table_entry));
 
     pi::ActionEntry action_entry;
     pi_meter_spec_t _meter_spec_storage;
@@ -2414,6 +2555,11 @@ class DeviceMgrImp {
     RETURN_IF_ERROR(construct_direct_resources(
         table_entry, &action_entry,
         &_meter_spec_storage, &_counter_data_storage));
+    // Perform checks without the lock, then do the actual set in action_entry
+    // while holding the lock (since the operation requires knowing the previous
+    // TTL value).
+    StatusOr<bool> supports_idle_timeout = validate_entry_ttl(table_entry);
+    RETURN_IF_ERROR(supports_idle_timeout.status());
 
     auto table_lock = table_info_store.lock_table(table_id);
     // we need this pointer to update the controller metadata and the one-shot
@@ -2430,6 +2576,9 @@ class DeviceMgrImp {
                           role_id);
     }
     
+    if (supports_idle_timeout.ValueOrDie())
+      set_entry_ttl(table_entry, &action_entry, nullptr);
+
     pi::MatchTable mt(session->get(), device_tgt, p4info.get(), table_id);
     pi_status_t pi_status;
     if (table_entry.is_default_action()) {
@@ -2449,8 +2598,10 @@ class DeviceMgrImp {
       // cannot be false as the function returns early with an error otherwise
       assert(table_entry.is_default_action());
       entry_data->controller_metadata = 0;
+      entry_data->idle_timeout_ns = 0;
     } else {
       entry_data->controller_metadata = table_entry.controller_metadata();
+      entry_data->idle_timeout_ns = table_entry.idle_timeout_ns();
       if (table_entry.action().type_case() ==
           p4v1::TableAction::kActionProfileActionSet) {
         assert(entry_data->is_oneshot);
@@ -2642,6 +2793,29 @@ class DeviceMgrImp {
     RETURN_OK_STATUS();
   }
 
+  void idle_timeout_register_cb(StreamMessageResponseCb cb, void *cookie) {
+    idle_timeout_buffer.stream_message_response_register_cb(cb, cookie);
+    pi_table_idle_timeout_register_cb(
+        device_id, &DeviceMgrImp::idle_timeout_cb, static_cast<void *>(this));
+  }
+
+  static void idle_timeout_cb(
+      pi_dev_id_t dev_id, p4_id_t table_id,
+      const pi_match_key_t *match_key, pi_entry_handle_t handle,
+      void *cookie) {
+    (void) handle;
+    auto *device_mgr = static_cast<DeviceMgrImp *>(cookie);
+    if (dev_id != device_mgr->device_id) {
+      Logger::get()->error("Idle timeout notification does not match device");
+      return;
+    }
+    pi::MatchKey mk(device_mgr->p4info.get(), table_id);
+    mk.from(match_key);
+    // move match key to avoid extra copies
+    device_mgr->idle_timeout_buffer.handle_notification(
+        table_id, std::move(mk));
+  }
+
   // Saves the existing forwarding state as one ReadResponse message; meant to
   // be used for the RECONCILE_AND_COMMIT mode of SetForwardingPipeline.
   // We assume that the exclusive lock has been acquired by the caller, which is
@@ -2710,7 +2884,14 @@ class DeviceMgrImp {
 
   P4InfoWrapper p4info{nullptr, p4info_deleter};
 
+  TableInfoStore table_info_store;
+
   PacketIOMgr packet_io;
+
+  DigestMgr digest_mgr;
+
+  // has non-owning pointer to table_info_store
+  IdleTimeoutBuffer idle_timeout_buffer;
 
   // ActionProfMgr is not movable because of mutex
   std::unordered_map<pi_p4_id_t, std::unique_ptr<ActionProfMgr> >
@@ -2718,8 +2899,6 @@ class DeviceMgrImp {
 
   std::unique_ptr<PreMcMgr> pre_mc_mgr;
   std::unique_ptr<PreCloneMgr> pre_clone_mgr;
-
-  TableInfoStore table_info_store;
 
   mutable SharedMutex shared_mutex{};
 };
@@ -2769,13 +2948,15 @@ DeviceMgr::read_one(const p4v1::Entity &entity,
 }
 
 Status
-DeviceMgr::packet_out_send(const p4v1::PacketOut &packet) const {
-  return pimp->packet_out_send(packet);
+DeviceMgr::stream_message_request_handle(
+    const p4::v1::StreamMessageRequest &request) {
+  return pimp->stream_message_request_handle(request);
 }
 
 void
-DeviceMgr::packet_in_register_cb(PacketInCb cb, void *cookie) {
-  return pimp->packet_in_register_cb(cb, cookie);
+DeviceMgr::stream_message_response_register_cb(StreamMessageResponseCb cb,
+                                               void *cookie) {
+  return pimp->stream_message_response_register_cb(std::move(cb), cookie);
 }
 
 void

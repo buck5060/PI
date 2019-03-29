@@ -25,7 +25,7 @@
 #include <boost/functional/hash.hpp>
 #include <boost/optional.hpp>
 
-#include <algorithm>  // std::copy
+#include <algorithm>  // std::copy, std::for_each
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -38,6 +38,8 @@
 #include "PI/pi.h"
 #include "PI/pi_mc.h"
 #include "PI/target/pi_imp.h"
+#include "PI/target/pi_learn_imp.h"
+#include "PI/target/pi_tables_imp.h"
 
 namespace pi {
 namespace proto {
@@ -47,6 +49,7 @@ namespace {
 
 using ::testing::_;
 using ::testing::Invoke;
+using ::testing::Return;
 
 class DummyMatchKey {
   friend struct DummyMatchKeyHash;
@@ -69,6 +72,14 @@ class DummyMatchKey {
     std::copy(mk.begin(), mk.end(), dst + s);
     s += mk.size();
     return s;
+  }
+
+  void get_match_key(pi_match_key_t *match_key,
+                     std::vector<char> *storage) const {
+    *storage = mk;
+    match_key->priority = priority;
+    match_key->data_size = mk.size();
+    match_key->data = storage->data();
   }
 
   size_t nbytes() const {
@@ -182,6 +193,11 @@ class DummyTableEntry {
       default:
         assert(0);
     }
+    const auto *properties = table_entry->entry_properties;
+    if (properties &&
+        pi_entry_properties_is_set(properties, PI_ENTRY_PROPERTY_TYPE_TTL)) {
+      ttl_ns = properties->ttl_ns;
+    }
   }
 
   size_t emit(char *dst) const {
@@ -201,11 +217,14 @@ class DummyTableEntry {
     return s;
   }
 
+  uint64_t get_ttl() const { return ttl_ns; }
+
  private:
   pi_action_entry_type_t type;
   // not bothering with a union here
   ActionData ad;
   pi_indirect_handle_t indirect_h;
+  uint64_t ttl_ns{0};
 };
 
 class DummyTable {
@@ -331,6 +350,33 @@ class DummyTable {
     return PI_STATUS_SUCCESS;
   }
 
+  pi_status_t idle_timeout_config_set(const pi_idle_timeout_config_t *config) {
+    idle_timeout_config = *config;
+    return PI_STATUS_SUCCESS;
+  }
+
+  pi_status_t entry_get_remaining_ttl(pi_entry_handle_t entry_handle,
+                                      uint64_t *ttl_ns) {
+    auto it = entries.find(entry_handle);
+    if (it == entries.end()) return PI_STATUS_TARGET_ERROR;
+    // we do not do any "real" ageing, we always return the initial TTL value
+    *ttl_ns = it->second.entry.get_ttl();
+    return PI_STATUS_SUCCESS;
+  }
+
+  pi_status_t entry_age(pi_dev_id_t dev_id,  // required to generate notif
+                        pi_entry_handle_t entry_handle) const {
+    auto it = entries.find(entry_handle);
+    if (it == entries.end()) return PI_STATUS_TARGET_ERROR;
+    std::vector<char> match_key_data;
+    pi_match_key_t match_key;
+    match_key.p4info = nullptr;
+    match_key.table_id = table_id;
+    it->second.mk.get_match_key(&match_key, &match_key_data);
+    return pi_table_idle_timeout_notify(
+        dev_id, table_id, &match_key, entry_handle);
+  }
+
  private:
   bool has_ternary_match() const {
     size_t num_mfs = pi_p4info_table_num_match_fields(p4info, table_id);
@@ -380,6 +426,7 @@ class DummyTable {
   size_t entry_counter{0};
   std::map<pi_p4_id_t, DummyCounter *> counters{};
   std::map<pi_p4_id_t, DummyMeter *> meters{};
+  pi_idle_timeout_config_t idle_timeout_config{{}};  // zero-initialize
 };
 
 class DummyActionProf {
@@ -430,6 +477,16 @@ class DummyActionProf {
     if (it == groups.end()) return PI_STATUS_TARGET_ERROR;
     auto count = it->second.erase(mbr_handle);
     return (count == 0) ? PI_STATUS_TARGET_ERROR : PI_STATUS_SUCCESS;
+  }
+
+  pi_status_t group_set_members(pi_indirect_handle_t grp_handle,
+                                size_t num_mbrs,
+                                const pi_indirect_handle_t *mbr_handles) {
+    auto it = groups.find(grp_handle);
+    if (it == groups.end()) return PI_STATUS_TARGET_ERROR;
+    it->second.clear();
+    it->second.insert(mbr_handles, mbr_handles + num_mbrs);
+    return PI_STATUS_SUCCESS;
   }
 
   pi_status_t entries_fetch(pi_act_prof_fetch_res_t *res) {
@@ -620,6 +677,17 @@ class DummySwitch {
     return get_table(table_id).entries_fetch(res);
   }
 
+  pi_status_t table_idle_timeout_config_set(
+      pi_p4_id_t table_id, const pi_idle_timeout_config_t *config) {
+    return get_table(table_id).idle_timeout_config_set(config);
+  }
+
+  pi_status_t table_entry_get_remaining_ttl(pi_p4_id_t table_id,
+                                            pi_entry_handle_t entry_handle,
+                                            uint64_t *ttl_ns) {
+    return get_table(table_id).entry_get_remaining_ttl(entry_handle, ttl_ns);
+  }
+
   pi_status_t action_prof_member_create(pi_p4_id_t act_prof_id,
                                         const pi_action_data_t *action_data,
                                         pi_indirect_handle_t *mbr_handle) {
@@ -660,6 +728,15 @@ class DummySwitch {
                                               pi_indirect_handle_t mbr_handle) {
     return action_profs[act_prof_id].group_remove_member(
         grp_handle, mbr_handle);
+  }
+
+  pi_status_t action_prof_group_set_members(
+      pi_p4_id_t act_prof_id,
+      pi_indirect_handle_t grp_handle,
+      size_t num_mbrs,
+      const pi_indirect_handle_t *mbr_handles) {
+    return action_profs[act_prof_id].group_set_members(
+        grp_handle, num_mbrs, mbr_handles);
   }
 
   pi_status_t action_prof_entries_fetch(pi_p4_id_t act_prof_id,
@@ -767,6 +844,50 @@ class DummySwitch {
     return pre.clone_session_reset(clone_session_id);
   }
 
+  pi_status_t learn_config_set(pi_p4_id_t learn_id,
+                               const pi_learn_config_t *config) {
+    (void)learn_id;
+    (void)config;
+    return PI_STATUS_SUCCESS;
+  }
+
+  pi_status_t learn_msg_ack(pi_p4_id_t learn_id, pi_learn_msg_id_t msg_id) {
+    (void)learn_id;
+    (void)msg_id;
+    return PI_STATUS_SUCCESS;
+  }
+
+  pi_status_t learn_msg_done(pi_learn_msg_t *msg) {
+    delete[] msg->entries;
+    delete msg;
+    return PI_STATUS_SUCCESS;
+  }
+
+  pi_status_t learn_new_msg(pi_p4_id_t learn_id,
+                            pi_learn_msg_id_t msg_id,
+                            const std::vector<std::string> &samples) const {
+    if (samples.empty()) return PI_STATUS_SUCCESS;
+    auto *msg = new pi_learn_msg_t;
+    msg->dev_tgt = {device_id, 0xff};
+    msg->learn_id = learn_id;
+    msg->msg_id = msg_id;
+    msg->num_entries = samples.size();
+    msg->entry_size = samples.front().size();
+    auto *entries = new char[msg->num_entries * msg->entry_size];
+    msg->entries = entries;
+    std::for_each(samples.begin(), samples.end(),
+                  [&entries](const std::string &s) {
+      std::memcpy(entries, s.data(), s.size());
+      entries += s.size();
+    });
+    return pi_learn_new_msg(msg);
+  }
+
+  pi_status_t age_entry(pi_p4_id_t table_id,
+                        pi_entry_handle_t entry_handle) {
+    return get_table(table_id).entry_age(device_id, entry_handle);
+  }
+
   void set_p4info(const pi_p4info_t *p4info) {
     this->p4info = p4info;
   }
@@ -834,6 +955,10 @@ DummySwitchMock::DummySwitchMock(device_id_t device_id)
       .WillByDefault(Invoke(sw_, &DummySwitch::table_entry_modify_wkey));
   ON_CALL(*this, table_entries_fetch(_, _))
       .WillByDefault(Invoke(sw_, &DummySwitch::table_entries_fetch));
+  ON_CALL(*this, table_idle_timeout_config_set(_, _))
+      .WillByDefault(Invoke(sw_, &DummySwitch::table_idle_timeout_config_set));
+  ON_CALL(*this, table_entry_get_remaining_ttl(_, _, _))
+      .WillByDefault(Invoke(sw_, &DummySwitch::table_entry_get_remaining_ttl));
 
   // cannot use DoAll to combine 2 actions here (call to real object + handle
   // capture), because the handle needs to be captured after the delegated call,
@@ -855,8 +980,12 @@ DummySwitchMock::DummySwitchMock(device_id_t device_id)
   ON_CALL(*this, action_prof_group_remove_member(_, _, _))
       .WillByDefault(
           Invoke(sw_, &DummySwitch::action_prof_group_remove_member));
+  ON_CALL(*this, action_prof_group_set_members(_, _, _, _))
+      .WillByDefault(Invoke(sw_, &DummySwitch::action_prof_group_set_members));
   ON_CALL(*this, action_prof_entries_fetch(_, _))
       .WillByDefault(Invoke(sw_, &DummySwitch::action_prof_entries_fetch));
+  ON_CALL(*this, action_prof_api_support()).WillByDefault(Return(
+      static_cast<int>(PiActProfApiSupport_BOTH)));
 
   ON_CALL(*this, meter_read(_, _, _))
       .WillByDefault(Invoke(sw_, &DummySwitch::meter_read));
@@ -900,6 +1029,13 @@ DummySwitchMock::DummySwitchMock(device_id_t device_id)
       .WillByDefault(Invoke(sw_, &DummySwitch::clone_session_set));
   ON_CALL(*this, clone_session_reset(_))
       .WillByDefault(Invoke(sw_, &DummySwitch::clone_session_reset));
+
+  ON_CALL(*this, learn_config_set(_, _))
+      .WillByDefault(Invoke(sw_, &DummySwitch::learn_config_set));
+  ON_CALL(*this, learn_msg_ack(_, _))
+      .WillByDefault(Invoke(sw_, &DummySwitch::learn_msg_ack));
+  ON_CALL(*this, learn_msg_done(_))
+      .WillByDefault(Invoke(sw_, &DummySwitch::learn_msg_done));
 }
 
 DummySwitchMock::~DummySwitchMock() = default;
@@ -973,6 +1109,19 @@ DummySwitchMock::get_mc_node_handle() const {
 pi_status_t
 DummySwitchMock::packetin_inject(const std::string &packet) const {
   return sw->packetin_inject(packet);
+}
+
+pi_status_t
+DummySwitchMock::digest_inject(pi_p4_id_t learn_id,
+                               pi_learn_msg_id_t msg_id,
+                               const std::vector<std::string> &samples) const {
+  return sw->learn_new_msg(learn_id, msg_id, samples);
+}
+
+pi_status_t
+DummySwitchMock::age_entry(pi_p4_id_t table_id,
+                           pi_entry_handle_t entry_handle) const {
+  return sw->age_entry(table_id, entry_handle);
 }
 
 void
@@ -1114,6 +1263,24 @@ pi_status_t _pi_table_entries_fetch_done(pi_session_handle_t,
   return PI_STATUS_SUCCESS;
 }
 
+pi_status_t _pi_table_idle_timeout_config_set(
+    pi_session_handle_t,
+    pi_dev_id_t dev_id,
+    pi_p4_id_t table_id,
+    const pi_idle_timeout_config_t *config) {
+  return DeviceResolver::get_switch(dev_id)->table_idle_timeout_config_set(
+      table_id, config);
+}
+
+pi_status_t _pi_table_entry_get_remaining_ttl(pi_session_handle_t,
+                                              pi_dev_id_t dev_id,
+                                              pi_p4_id_t table_id,
+                                              pi_entry_handle_t entry_handle,
+                                              uint64_t *ttl_ns) {
+  return DeviceResolver::get_switch(dev_id)->table_entry_get_remaining_ttl(
+      table_id, entry_handle, ttl_ns);
+}
+
 pi_status_t _pi_act_prof_mbr_create(pi_session_handle_t,
                                     pi_dev_tgt_t dev_tgt,
                                     pi_p4_id_t act_prof_id,
@@ -1170,6 +1337,16 @@ pi_status_t _pi_act_prof_grp_remove_mbr(pi_session_handle_t,
       act_prof_id, grp_handle, mbr_handle);
 }
 
+pi_status_t _pi_act_prof_grp_set_mbrs(pi_session_handle_t,
+                                      pi_dev_id_t dev_id,
+                                      pi_p4_id_t act_prof_id,
+                                      pi_indirect_handle_t grp_handle,
+                                      size_t num_mbrs,
+                                      const pi_indirect_handle_t *mbr_handles) {
+  return DeviceResolver::get_switch(dev_id)->action_prof_group_set_members(
+      act_prof_id, grp_handle, num_mbrs, mbr_handles);
+}
+
 pi_status_t _pi_act_prof_entries_fetch(pi_session_handle_t,
                                        pi_dev_id_t dev_id,
                                        pi_p4_id_t act_prof_id,
@@ -1184,6 +1361,10 @@ pi_status_t _pi_act_prof_entries_fetch_done(pi_session_handle_t,
   delete[] res->entries_groups;
   delete[] res->mbr_handles;
   return PI_STATUS_SUCCESS;
+}
+
+int _pi_act_prof_api_support(pi_dev_id_t dev_id) {
+  return DeviceResolver::get_switch(dev_id)->action_prof_api_support();
 }
 
 pi_status_t _pi_meter_read(pi_session_handle_t,
@@ -1342,14 +1523,21 @@ pi_status_t _pi_clone_session_reset(pi_session_handle_t,
       clone_session_id);
 }
 
-pi_status_t _pi_learn_msg_ack(pi_session_handle_t,
-                              pi_dev_id_t, pi_p4_id_t,
-                              pi_learn_msg_id_t) {
-  return PI_STATUS_NOT_IMPLEMENTED_BY_TARGET;
+pi_status_t _pi_learn_config_set(pi_session_handle_t,
+                                 pi_dev_id_t dev_id, pi_p4_id_t learn_id,
+                                 const pi_learn_config_t *config) {
+  return DeviceResolver::get_switch(dev_id)->learn_config_set(learn_id, config);
 }
 
-pi_status_t _pi_learn_msg_done(pi_learn_msg_t *) {
-  return PI_STATUS_NOT_IMPLEMENTED_BY_TARGET;
+pi_status_t _pi_learn_msg_ack(pi_session_handle_t,
+                              pi_dev_id_t dev_id,
+                              pi_p4_id_t learn_id,
+                              pi_learn_msg_id_t msg_id) {
+  return DeviceResolver::get_switch(dev_id)->learn_msg_ack(learn_id, msg_id);
+}
+
+pi_status_t _pi_learn_msg_done(pi_learn_msg_t *msg) {
+  return DeviceResolver::get_switch(msg->dev_tgt.dev_id)->learn_msg_done(msg);
 }
 
 }

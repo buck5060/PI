@@ -513,9 +513,15 @@ static pi_status_t read_tables(reader_state_t *state, cJSON *root,
     // runtime
     bool is_const = (entries_array && cJSON_GetArraySize(entries_array) > 0);
 
+    item = cJSON_GetObjectItem(table, "support_timeout");
+    if (!item) return PI_STATUS_CONFIG_READER_ERROR;
+    if (item->type != cJSON_True && item->type != cJSON_False)
+      return PI_STATUS_CONFIG_READER_ERROR;
+    bool supports_idle_timeout = (item->type == cJSON_True);
+
     PI_LOG_DEBUG("Adding table '%s'\n", name);
     pi_p4info_table_add(p4info, pi_id, name, num_match_fields, num_actions,
-                        max_size, is_const);
+                        max_size, is_const, supports_idle_timeout);
 
     import_pragmas(table, p4info, pi_id);
 
@@ -555,7 +561,8 @@ static pi_status_t read_tables(reader_state_t *state, cJSON *root,
     cJSON_ArrayForEach(action, json_actions) {
       const char *aname = action->valuestring;
       pi_p4_id_t aid = pi_p4info_action_id_from_name(p4info, aname);
-      pi_p4info_table_add_action(p4info, pi_id, aid);
+      pi_p4info_table_add_action(p4info, pi_id, aid,
+                                 PI_P4INFO_ACTION_SCOPE_TABLE_AND_DEFAULT);
     }
 
     item = cJSON_GetObjectItem(table, "type");
@@ -745,6 +752,16 @@ static pi_status_t read_meters(reader_state_t *state, cJSON *root,
   return PI_STATUS_SUCCESS;
 }
 
+static pi_status_t read_digests(reader_state_t *state, cJSON *root,
+                                pi_p4info_t *p4info) {
+  (void)state;
+  (void)root;
+  assert(root);
+  // TODO(antonin): skeleton so that unit tests pass, implement later if needed
+  pi_p4info_digest_init(p4info, 0);
+  return PI_STATUS_SUCCESS;
+}
+
 static bool check_json_version(cJSON *root) {
   cJSON *item;
   item = cJSON_GetObjectItem(root, "__meta__");
@@ -794,6 +811,10 @@ pi_status_t pi_bmv2_json_reader(const char *config, pi_p4info_t *p4info) {
   }
 
   if ((status = read_meters(&state, root, p4info)) != PI_STATUS_SUCCESS) {
+    return status;
+  }
+
+  if ((status = read_digests(&state, root, p4info)) != PI_STATUS_SUCCESS) {
     return status;
   }
 

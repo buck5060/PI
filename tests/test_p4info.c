@@ -32,6 +32,7 @@
 
 #define DEFAULT_TABLE_SIZE 1024
 #define DEFAULT_TABLE_IS_CONST false
+#define DEFAULT_TABLE_IDLE_TIMEOUT false
 
 static pi_p4info_t *p4info;
 
@@ -240,15 +241,15 @@ void gen_rand_ids(pi_p4_id_t *ids, pi_p4_id_t max, size_t num) {
 #pragma GCC diagnostic pop
 }
 
-static void check_default_action(pi_p4_id_t tid, pi_p4_id_t expected_id,
-                                 bool expected_mutable_params) {
+static void check_default_action(pi_p4_id_t tid, pi_p4_id_t expected_id) {
   TEST_ASSERT_EQUAL_INT(expected_id != PI_INVALID_ID,
                         pi_p4info_table_has_const_default_action(p4info, tid));
   bool has_mutable_params;
   pi_p4_id_t default_action_id = pi_p4info_table_get_const_default_action(
       p4info, tid, &has_mutable_params);
   TEST_ASSERT_EQUAL_UINT(expected_id, default_action_id);
-  TEST_ASSERT_EQUAL_INT(expected_mutable_params, has_mutable_params);
+  // no const default action <=> params are mutable
+  TEST_ASSERT_EQUAL_INT(expected_id == PI_INVALID_ID, has_mutable_params);
 }
 
 TEST(P4Info, TablesStress) {
@@ -276,7 +277,8 @@ TEST(P4Info, TablesStress) {
     tdata[i].num_actions = rand() % (max_actions + 1);
     pi_p4info_table_add(p4info, tdata[i].id, tdata[i].name,
                         tdata[i].num_match_fields, tdata[i].num_actions,
-                        DEFAULT_TABLE_SIZE, DEFAULT_TABLE_IS_CONST);
+                        DEFAULT_TABLE_SIZE, DEFAULT_TABLE_IS_CONST,
+                        DEFAULT_TABLE_IDLE_TIMEOUT);
     for (size_t j = 0; j < tdata[i].num_match_fields; j++) {
       pi_p4_id_t id = j;
       snprintf(name, sizeof(name), "f%zu", (size_t)id);
@@ -292,7 +294,8 @@ TEST(P4Info, TablesStress) {
     for (size_t j = 0; j < tdata[i].num_actions; j++) {
       tdata[i].actions[j] = pi_make_action_id(tdata[i].actions[j]);
       pi_p4_id_t id = tdata[i].actions[j];
-      pi_p4info_table_add_action(p4info, tdata[i].id, id);
+      pi_p4info_table_add_action(p4info, tdata[i].id, id,
+                                 PI_P4INFO_ACTION_SCOPE_TABLE_AND_DEFAULT);
     }
   }
 
@@ -366,15 +369,10 @@ TEST(P4Info, TablesStress) {
   for (size_t i = 0; i < num_tables; i++) {
     if (tdata[i].num_actions == 0) continue;
     pi_p4_id_t action_id = tdata[i].actions[0];
-    check_default_action(tdata[i].id, PI_INVALID_ID, false);
+    check_default_action(tdata[i].id, PI_INVALID_ID);
 
-    pi_p4info_table_set_const_default_action(p4info, tdata[i].id, action_id,
-                                             false);
-    check_default_action(tdata[i].id, action_id, false);
-
-    pi_p4info_table_set_const_default_action(p4info, tdata[i].id, action_id,
-                                             true);
-    check_default_action(tdata[i].id, action_id, true);
+    pi_p4info_table_set_const_default_action(p4info, tdata[i].id, action_id);
+    check_default_action(tdata[i].id, action_id);
   }
 
   free(tdata);
@@ -389,7 +387,8 @@ TEST(P4Info, TablesIterator) {
   for (size_t i = 0; i < num_tables; i++) {
     snprintf(name, sizeof(name), "a%zu", i);
     pi_p4info_table_add(p4info, pi_make_table_id(i), name, 0, 1,
-                        DEFAULT_TABLE_SIZE, DEFAULT_TABLE_IS_CONST);
+                        DEFAULT_TABLE_SIZE, DEFAULT_TABLE_IS_CONST,
+                        DEFAULT_TABLE_IDLE_TIMEOUT);
   }
 
   size_t cnt = 0;
@@ -440,7 +439,7 @@ static void add_one_of_each() {
 
   pi_p4info_action_add(p4info, pi_make_action_id(0), "action0", 0);
   pi_p4info_table_add(p4info, pi_make_table_id(0), "table0", 0, 0, 128,
-                      DEFAULT_TABLE_IS_CONST);
+                      DEFAULT_TABLE_IS_CONST, DEFAULT_TABLE_IDLE_TIMEOUT);
   pi_p4info_act_prof_add(p4info, pi_make_act_prof_id(0), "act_prof0", false, 8);
   pi_p4info_counter_add(p4info, pi_make_counter_id(0), "counter0",
                         PI_P4INFO_COUNTER_UNIT_BOTH, 128);
