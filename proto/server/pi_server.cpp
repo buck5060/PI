@@ -187,10 +187,13 @@ class DeviceState {
   void send_stream_message(p4v1::StreamMessageResponse *msg) {
     std::lock_guard<std::mutex> lock(m);
     //Get role_id from packet
-    p4v1::PacketMetadata metadata = packet->metadata(1);
     uint64_t role_id = 0;
-    for (char c : metadata.value())
-      role_id = (role_id << 1) | c;
+    if (msg->update_case() == p4v1::StreamMessageResponse::kPacket) {
+          p4v1::PacketIn packet = msg->packet();
+          p4v1::PacketMetadata metadata = packet.metadata(1);
+          for (char c : metadata.value())
+            role_id = (role_id << 1) | c;
+    }
 
     auto connection_role_id = get_by_role_id(role_id);
     if (connection_role_id != nullptr){
